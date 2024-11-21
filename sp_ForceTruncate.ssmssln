@@ -1,0 +1,22 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# SQL Server Management Studio Solution File, Format Version 19.00
+VisualStudioVersion = 15.0.28307.421
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{4F2E2C19-372F-40D8-9FA7-9D2138C6997A}") = "sp_ForceTruncate", "sp_ForceTruncate.ssmssqlproj", "{62932803-C761-41E1-AF47-D92C9B421611}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Default|Default = Default|Default
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{62932803-C761-41E1-AF47-D92C9B421611}.Default|Default.ActiveCfg = Default
+		{7A885036-7902-4DCE-87D4-45034C934DAD}.Default|Default.ActiveCfg = Default
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {0000B2ED-7FF6-465E-A523-C221B2EC36CE}
+	EndGlobalSection
+EndGlobal
