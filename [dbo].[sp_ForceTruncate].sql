@@ -34,15 +34,15 @@ ALTER PROCEDURE [dbo].[sp_ForceTruncate]
                                                                                                                        
    EXEC [dbo].[sp_ForceTruncate]                                                                                       
      @SchemaNames = N'Sales'                                                                                           
-   , @TableNames  = N'SalesOrderHeader,SalesOrderHeaderSalesReason,Customer,CreditCard,PersonCreditCard,CurrencyRate'
-   , @ContinueOnError = 1
+   , @TableNames  = N'SalesOrderHeader,SalesOrderHeaderSalesReason,Customer,CreditCard,PersonCreditCard,CurrencyRate';
 */
-/*	THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO    */
-/*  THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE      */
-/*	AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, */
-/*  TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE      */
-/*	SOFTWARE.                                                                                                           */
-/* ==================================================================================================================== */
+/*THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO    */
+/*THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE      */
+/*AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, */
+/*TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE      */
+/*SOFTWARE.                                                                                                           */
+/*LICENSE: https://github.com/CleanSql-com/sp_ForceTruncate?tab=MIT-1-ov-file#readme                                  */
+/* ===================================================================================================================*/
 
     /* Input parameters: */
     @SchemaNames                     NVARCHAR(MAX) = N''    /* for example: N'Sales' */
