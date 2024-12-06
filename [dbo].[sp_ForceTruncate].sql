@@ -26,15 +26,25 @@ ALTER PROCEDURE [dbo].[sp_ForceTruncate]
 /* Date:       User:           Version:  Change:                                                                        */
 /* -------------------------------------------------------------------------------------------------------------------- */
 /* 2024-11-21  CleanSql.com    1.0       Created                                                                        */
+/* 2024-12-06  CleanSql.com    1.1       added @SchemaName/@TableName validation                                        */
+/*                                       allowed new-lines in input params: @SchemaNames/@TableNames if present         */
+/*                                       using sys.tables for @TruncateAllTablesPerDB instead of INFORMATION_SCHEMA     */
 /* -------------------------------------------------------------------------------------------------------------------- */
 /* ==================================================================================================================== */
 /* Example use:
                                                                                                                      
-   USE [AdventureWorks2019];                                                                                           
-                                                                                                                       
-   EXEC [dbo].[sp_ForceTruncate]                                                                                       
-     @SchemaNames = N'Sales'                                                                                           
-   , @TableNames  = N'SalesOrderHeader,SalesOrderHeaderSalesReason,Customer,CreditCard,PersonCreditCard,CurrencyRate';
+USE [AdventureWorks2019];
+GO
+
+DECLARE @SchemaNames         NVARCHAR(MAX) = N'Sales
+                                              ,Production'           
+      , @TableNames          NVARCHAR(MAX) = N'SalesOrderDetail
+                                              ,Product
+                                              ,SalesOrderHeader
+                                              ,Document' 
+
+EXEC [dbo].[sp_ForceTruncate] @SchemaNames = @SchemaNames
+                            , @TableNames = @TableNames
 */
 /*THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO    */
 /*THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE      */
@@ -137,7 +147,6 @@ DECLARE
   , @level0name                      SYSNAME
   , @level1type                      VARCHAR(128)
   , @level1name                      SYSNAME
-  --, @cr                              CHAR(32)      = CHAR(13)
   , @crlf                            CHAR(32)      = CONCAT(CHAR(13), CHAR(10))
   , @UnionAll                        VARCHAR(32)   = CONCAT(CHAR(10), 'UNION ALL', CHAR(10))
 
@@ -167,6 +176,12 @@ BEGIN
     SET @ErrorMessage = N'If you want to truncate ALL tables per DB by using @TruncateAllTablesPerDB = 1 then @SchemaNames AND @TableNames must be empty';
     GOTO ERROR;
 END;
+
+/* remove new-line and append delimiter at the end of @SchemaNames/@TableNames if it is missing: */
+SET @SchemaNames = REPLACE(@SchemaNames, @crlf, '')
+SET @TableNames = REPLACE(@TableNames, @crlf, '')
+IF  LEN(@SchemaNames) > 0 AND (RIGHT(@SchemaNames, 1)) <> @Delimiter SET @SchemaNames = CONCAT(@SchemaNames, @Delimiter);
+IF  LEN(@TableNames) > 0 AND (RIGHT(@TableNames, 1)) <> @Delimiter SET @TableNames = CONCAT(@TableNames, @Delimiter);
 
 CREATE TABLE [#SelectedTables]
 (
@@ -337,8 +352,6 @@ CREATE TABLE [#sp_helparticle]
 /* ----------------------------------------- COLLECTING METADATA: ----------------------------------------------------- */
 /* ==================================================================================================================== */
 
-IF LEN(@SchemaNames) > 0 AND (RIGHT(@SchemaNames, 1)) <> @Delimiter SET @SchemaNames = CONCAT(@SchemaNames, @Delimiter);
-IF LEN(@TableNames) > 0 AND (RIGHT(@TableNames, 1)) <> @Delimiter SET @TableNames = CONCAT(@TableNames, @Delimiter);
 IF (@WhatIf = 1 )
 BEGIN
     PRINT(CONCAT('USE [', DB_NAME(), ']'));
@@ -361,7 +374,12 @@ BEGIN
 
         EXEC sys.sp_executesql @stmt = @SqlSchemaId, @params = @ParamDefinition, @_SchemaName = @SchemaName, @_SchemaId = @SchemaId OUTPUT;
 
-        IF (@SchemaId IS NOT NULL)
+        IF (@SchemaId IS NULL)
+        BEGIN
+            SET @ErrorMessage = CONCAT('Could not find @SchemaName: ', @SchemaName);
+            GOTO ERROR;    
+        END
+        ELSE 
         BEGIN
             SET @StartSearchTbl = 0;
             SET @DelimiterPosTbl = 0;
@@ -371,6 +389,12 @@ BEGIN
                 SET @DelimiterPosTbl = CHARINDEX(@Delimiter, @TableNames, @StartSearchTbl + 1) - @StartSearchTbl;
                 SET @TableName = SUBSTRING(@TableNames, @StartSearchTbl, @DelimiterPosTbl);
 
+                IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE [name] = @TableName)
+                BEGIN
+                    SET @ErrorMessage = CONCAT('Could not find @TableName: ', @TableName, ' LEN: ', LEN(@TableName));
+                    GOTO ERROR;
+                END                
+                
                 SET @ObjectId = NULL;
                 SET @ObjectId = OBJECT_ID('[' + @SchemaName + '].[' + @TableName + ']');
 
@@ -395,14 +419,15 @@ BEGIN
           );
 
     INSERT INTO [#SelectedTables] ([SchemaID], [ObjectID], [SchemaName], [TableName], [IsTruncated])
-    SELECT SCHEMA_ID([TABLE_SCHEMA])
-         , OBJECT_ID(QUOTENAME([TABLE_SCHEMA]) + '.' + QUOTENAME([TABLE_NAME]))
-         , [TABLE_SCHEMA]
-         , [TABLE_NAME]
+    SELECT [ss].[schema_id] AS [SchemaID]
+         , [st].[object_id] AS [ObjectID]
+         , [ss].[name] AS [SchemaName]
+         , [st].[name] AS [TableName]
          , 0
-    FROM [INFORMATION_SCHEMA].[TABLES]
-    WHERE [TABLE_TYPE] = 'BASE TABLE'
-    AND   [TABLE_SCHEMA] NOT IN ( 'cdc', 'sys' );
+    FROM sys.tables AS [st]
+    JOIN sys.schemas AS [ss]
+        ON [st].[schema_id] = [ss].[schema_id]
+    WHERE [st].[is_ms_shipped] <> 1;
 END;
 PRINT ('/*--------------------------------------- END OF COLLECTING [#SelectedTables] ------------------------------------*/');
 
@@ -422,43 +447,40 @@ SELECT @Id = MIN([Id]), @IdMax = MAX([Id]) FROM [#SelectedTables];
 WHILE (@Id <= @IdMax)
 BEGIN
     SELECT @SqlTableCounts
-        = CASE
-              WHEN @DbEngineVersion < 14
-        /* For SQL Versions older than 14 (2017) use FOR XML PATH instead of STRING_AGG(): */
-        THEN
-                  STUFF(
-    (
-        SELECT @UnionAll + ' SELECT ' + CAST([ObjectID] AS NVARCHAR(MAX)) + ' AS [ObjectID], ' + '''' + CAST(QUOTENAME([SchemaName]) AS NVARCHAR(MAX)) + '.'
-               + CAST(QUOTENAME([TableName]) AS NVARCHAR(MAX)) + ''' AS [TableName], COUNT_BIG(1) AS [RowCount] FROM ' + CAST(QUOTENAME([SchemaName]) AS NVARCHAR(MAX)) + '.'
-               + CAST(QUOTENAME([TableName]) AS NVARCHAR(MAX))
-        FROM [#SelectedTables]
-        WHERE [Id] BETWEEN @Id AND (@Id + @BatchSize)
-        FOR XML PATH(''), TYPE
-    ).[value]('.', 'NVARCHAR(MAX)')
-  , 1
-  , LEN(@UnionAll)
-  , ''
-                       )
-              ELSE
-                  /* For SQL Versions 14+ (2017+) use STRING_AGG(): */
-                  STRING_AGG(
-                                CONCAT(
-                                          'SELECT '
-                                        , CAST([ObjectID] AS NVARCHAR(MAX))
-                                        , ' AS [ObjectID], '
-                                        , ''''
-                                        , CAST(QUOTENAME([SchemaName]) AS NVARCHAR(MAX))
-                                        , '.'
-                                        , CAST(QUOTENAME([TableName]) AS NVARCHAR(MAX))
-                                        , ''' AS [TableName], COUNT_BIG(1) AS [RowCount] FROM '
-                                        , CAST(QUOTENAME([SchemaName]) AS NVARCHAR(MAX))
-                                        , '.'
-                                        , CAST(QUOTENAME([TableName]) AS NVARCHAR(MAX))
-                                      )
-                              , @UnionAll
-                            )
+        = CASE WHEN @DbEngineVersion < 14 /* For SQL Versions older than 14 (2017) use FOR XML PATH instead of STRING_AGG(): */          
+          THEN
+                    STUFF(
+                            (
+                                SELECT @UnionAll + ' SELECT ' + CAST([ObjectID] AS NVARCHAR(MAX)) + ' AS [ObjectID], ' + '''' + CAST(QUOTENAME([SchemaName]) AS NVARCHAR(MAX)) + '.'
+                                       + CAST(QUOTENAME([TableName]) AS NVARCHAR(MAX)) + ''' AS [TableName], COUNT_BIG(1) AS [RowCount] FROM ' + CAST(QUOTENAME([SchemaName]) AS NVARCHAR(MAX)) + '.'
+                                       + CAST(QUOTENAME([TableName]) AS NVARCHAR(MAX))
+                                FROM [#SelectedTables]
+                                WHERE [Id] BETWEEN @Id AND (@Id + @BatchSize)
+                                FOR XML PATH(''), TYPE
+                            ).[value]('.', 'NVARCHAR(MAX)')
+                          , 1
+                          , LEN(@UnionAll)
+                          , ''
+                         )
+          ELSE /* For SQL Versions 14+ (2017+) use STRING_AGG(): */
+                   STRING_AGG(
+                                 CONCAT(
+                                           'SELECT '
+                                         , CAST([ObjectID] AS NVARCHAR(MAX))
+                                         , ' AS [ObjectID], '
+                                         , ''''
+                                         , CAST(QUOTENAME([SchemaName]) AS NVARCHAR(MAX))
+                                         , '.'
+                                         , CAST(QUOTENAME([TableName]) AS NVARCHAR(MAX))
+                                         , ''' AS [TableName], COUNT_BIG(1) AS [RowCount] FROM '
+                                         , CAST(QUOTENAME([SchemaName]) AS NVARCHAR(MAX))
+                                         , '.'
+                                         , CAST(QUOTENAME([TableName]) AS NVARCHAR(MAX))
+                                       )
+                               , @UnionAll
+                             )
           END
-    FROM [#SelectedTables]
+    FROM  [#SelectedTables]
     WHERE [Id] BETWEEN @Id AND (@Id + @BatchSize);
 
     SET @SqlTableCounts = CONCAT(N'INSERT INTO [#TableRowCounts] ([ObjectID], [TableName], [RowCount])', @SqlTableCounts);
