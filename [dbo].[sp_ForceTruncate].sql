@@ -25,10 +25,11 @@ ALTER PROCEDURE [dbo].[sp_ForceTruncate]
 /* -------------------------------------------------------------------------------------------------------------------- */
 /* Date:       User:           Version:  Change:                                                                        */
 /* -------------------------------------------------------------------------------------------------------------------- */
-/* 2024-11-21  CleanSql.com    1.0       Created                                                                        */
-/* 2024-12-06  CleanSql.com    1.1       added @SchemaName/@TableName validation                                        */
+/* 2024-11-21  CleanSql.com    1.00      Created                                                                        */
+/* 2024-12-06  CleanSql.com    1.01      added @SchemaName/@TableName validation                                        */
 /*                                       allowed new-lines in input params: @SchemaNames/@TableNames if present         */
 /*                                       using sys.tables for @TruncateAllTablesPerDB instead of INFORMATION_SCHEMA     */
+/* 2024-12-12  CleanSql.com    1.02      improved @TableNames validation and error handling                             */
 /* -------------------------------------------------------------------------------------------------------------------- */
 /* ==================================================================================================================== */
 /* Example use:
@@ -83,10 +84,7 @@ DECLARE
 /* ==================================================================================================================== */
 
   /* Internal parameters: */
-    @ErrorMessage                    NVARCHAR(4000)
-  , @ErrorSeverity11                 INT           = 11     /* 11 changes the message color to red */
-  , @ErrorSeverity18                 INT           = 18     /* 16 and below does not break execution */
-  , @ErrorState                      INT
+    @SpCurrentVersion                CHAR(5) = '1.02'
   , @ObjectId                        BIGINT
   , @SchemaId                        INT
   , @StartSearchSch                  INT
@@ -100,9 +98,17 @@ DECLARE
   , @IdMax                           INT
   , @PercentProcessed                INT           = 0
   , @IsDbCDCEnabled                  BIT
+
+  /* error handling variables: */
+  , @ErrorMessage                    NVARCHAR(MAX)
+  , @ErrorSeverity11                 INT           = 11     /* 11 changes the message color to red */
+  , @ErrorSeverity18                 INT           = 18     /* 16 and below does not break execution */
+  , @ErrorState                      INT
+
   
   /* dynamic sql variables: */
   , @SqlSchemaId                     NVARCHAR(MAX)
+  , @SqlObjectId                     NVARCHAR(MAX)
   , @SqlDropConstraint               NVARCHAR(MAX)
   , @SqlDropView                     NVARCHAR(MAX)
   , @SqlTruncateTable                NVARCHAR(MAX)
@@ -351,6 +357,7 @@ CREATE TABLE [#sp_helparticle]
 /* ==================================================================================================================== */
 /* ----------------------------------------- COLLECTING METADATA: ----------------------------------------------------- */
 /* ==================================================================================================================== */
+PRINT(CONCAT('Current SP Version: ', @SpCurrentVersion))
 
 IF (@WhatIf = 1 )
 BEGIN
@@ -366,7 +373,7 @@ BEGIN
     WHILE CHARINDEX(@Delimiter, @SchemaNames, @StartSearchSch + 1) > 0
     BEGIN
         SET @DelimiterPosSch = CHARINDEX(@Delimiter, @SchemaNames, @StartSearchSch + 1) - @StartSearchSch;
-        SET @SchemaName = SUBSTRING(@SchemaNames, @StartSearchSch, @DelimiterPosSch);
+        SET @SchemaName = TRIM(SUBSTRING(@SchemaNames, @StartSearchSch, @DelimiterPosSch));
         SET @SchemaId = NULL;
 
         SET @SqlSchemaId = CONCAT('SELECT @_SchemaId = schema_id FROM [', DB_NAME(), '].sys.schemas WHERE name = @_SchemaName;');
@@ -376,7 +383,7 @@ BEGIN
 
         IF (@SchemaId IS NULL)
         BEGIN
-            SET @ErrorMessage = CONCAT('Could not find @SchemaName: ', @SchemaName);
+            SET @ErrorMessage = CONCAT('Could not find @SchemaName: ', QUOTENAME(@SchemaName), ' in Database: ', QUOTENAME(DB_NAME()));
             GOTO ERROR;    
         END
         ELSE 
@@ -387,22 +394,33 @@ BEGIN
             WHILE CHARINDEX(@Delimiter, @TableNames, @StartSearchTbl + 1) > 0
             BEGIN
                 SET @DelimiterPosTbl = CHARINDEX(@Delimiter, @TableNames, @StartSearchTbl + 1) - @StartSearchTbl;
-                SET @TableName = SUBSTRING(@TableNames, @StartSearchTbl, @DelimiterPosTbl);
+                SET @TableName = TRIM(SUBSTRING(@TableNames, @StartSearchTbl, @DelimiterPosTbl));
+                SET @ObjectId = NULL
 
-                IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE [name] = @TableName)
+                SET @SqlObjectId = CONCAT('SELECT @_ObjectId = object_id FROM [', DB_NAME(), '].sys.tables WHERE [is_ms_shipped] = 0 AND name = @_TableName;');
+                SET @ParamDefinition = N'@_TableName SYSNAME, @_ObjectId INT OUTPUT';
+
+                EXEC sys.sp_executesql @stmt = @SqlObjectId, @params = @ParamDefinition, @_TableName = @TableName, @_ObjectId = @ObjectId OUTPUT;
+
+                IF (@ObjectId IS NULL)
                 BEGIN
-                    SET @ErrorMessage = CONCAT('Could not find @TableName: ', @TableName, ' LEN: ', LEN(@TableName));
+                    SET @ErrorMessage = CONCAT('Could not find @TableName: ', QUOTENAME(@TableName), ' in any schema within Database: ', QUOTENAME(DB_NAME()));
                     GOTO ERROR;
-                END                
+                END
+                ELSE 
+                BEGIN
+                    /* PRINT(CONCAT('Found a Table with name: ', @TableName, ' now trying to find an ObjectId for: ', '[', @SchemaName, '].[', @TableName, ']')) */
+                    /* Below is not redundant: your @TableName may exist in other schema(s) not included in @SchemaNames so the @ObjectId obtained above may be wrong for that @TableName */                    
+                    SET @ObjectId = NULL
+                    SET @ObjectId = OBJECT_ID('[' + @SchemaName + '].[' + @TableName + ']');
+                END
                 
-                SET @ObjectId = NULL;
-                SET @ObjectId = OBJECT_ID('[' + @SchemaName + '].[' + @TableName + ']');
-
                 IF (@ObjectId IS NOT NULL)
                 BEGIN
                     INSERT INTO [#SelectedTables] ([SchemaID], [ObjectID], [SchemaName], [TableName], [IsTruncated])
                     VALUES (@SchemaId, @ObjectId, @SchemaName, @TableName, 0);
                 END;
+
                 SET @StartSearchTbl = CHARINDEX(@Delimiter, @TableNames, @StartSearchTbl + @DelimiterPosTbl) + 1;
             END;
         END;
