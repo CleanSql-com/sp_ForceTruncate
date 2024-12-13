@@ -29,7 +29,8 @@ ALTER PROCEDURE [dbo].[sp_ForceTruncate]
 /* 2024-12-06  CleanSql.com    1.01      added @SchemaName/@TableName validation                                        */
 /*                                       allowed new-lines in input params: @SchemaNames/@TableNames if present         */
 /*                                       using sys.tables for @TruncateAllTablesPerDB instead of INFORMATION_SCHEMA     */
-/* 2024-12-12  CleanSql.com    1.02      improved @TableNames validation and error handling                             */
+/* 2024-12-12  CleanSql.com    1.02      improved @TableNames validation and error handling,                            */
+/*                                       added support for [#IndexesOnSchemaBoundViews], encrypted SchBv error-handling */
 /* -------------------------------------------------------------------------------------------------------------------- */
 /* ==================================================================================================================== */
 /* Example use:
@@ -91,6 +92,7 @@ DECLARE
   , @DelimiterPosSch                 INT
   , @SchemaName                      SYSNAME
   , @TableName                       SYSNAME
+  , @SchBvName                       SYSNAME
   , @StartSearchTbl                  INT
   , @DelimiterPosTbl                 INT
   , @DbEngineVersion                 INT
@@ -116,6 +118,7 @@ DECLARE
   , @SqlRecreateConstraint           NVARCHAR(MAX)
   , @SqlRecreateView                 NVARCHAR(MAX)
   , @SqlXtndProperties               NVARCHAR(MAX)
+  , @SqlRecreateIdxOnSchBv           NVARCHAR(MAX)
   , @SqlReenableCDCInstance          NVARCHAR(MAX)
   , @SqlTableCounts                  NVARCHAR(MAX)
   , @SqlSetIsTruncated               NVARCHAR(MAX)
@@ -123,6 +126,7 @@ DECLARE
   , @SqlLogError                     NVARCHAR(MAX)
   
   , @IsTruncated                     BIT
+  , @IsEncrypted                     BIT
   , @ParamDefinition                 NVARCHAR(4000)
 
   , @CountTablesSelected             INT           = 0
@@ -253,16 +257,32 @@ CREATE TABLE [#SchemaBoundViews]
   , [ReferencingObjectSchema] NVARCHAR(128) NOT NULL
   , [ReferencingObjectName]   NVARCHAR(128) NOT NULL
   , [DropViewCommand]         NVARCHAR(MAX) NOT NULL
-  , [RecreateViewCommand]     NVARCHAR(MAX) NOT NULL
+  , [RecreateViewCommand]     NVARCHAR(MAX) NULL
+  , [IsEncrypted]             BIT           NOT NULL
   , [@level0type]             VARCHAR(128)  NULL
   , [@level0name]             SYSNAME       NULL
   , [@level1type]             VARCHAR(128)  NULL
   , [@level1name]             SYSNAME       NULL
   , [XtdProperties]           NVARCHAR(MAX) NULL
+  , [Dropped]                 BIT           NULL
+  , [Recreated]               BIT           NULL
   , [ErrorMessage]            NVARCHAR(MAX) NULL
 );
 
 CREATE TABLE [#SbvToSelTablesLink] ([ReferencingObjectId] BIGINT NOT NULL, [ReferncedObjectId] BIGINT NOT NULL);
+
+CREATE TABLE [#IndexesOnSchemaBoundViews]
+(
+    [Id]                     INT           NOT NULL PRIMARY KEY CLUSTERED IDENTITY(1, 1)
+  , [ReferencedViewObjectId] INT           NOT NULL
+  , [IndexId]                INT           NOT NULL
+  , [IsUnique]               VARCHAR(7)    NOT NULL
+  , [IndexType]              VARCHAR(60)   NOT NULL
+  , [IndexName]              SYSNAME       NOT NULL
+  , [OnView]                 SYSNAME       NOT NULL
+  , [ColumnNames]            NVARCHAR(MAX) NOT NULL
+  , UNIQUE ([ReferencedViewObjectId], [IndexId])
+);
 
 CREATE TABLE [#CDCInstances]
 (
@@ -278,7 +298,7 @@ CREATE TABLE [#CDCInstances]
   , [captured_column_list]   NVARCHAR(4000) NULL
   , [filegroup_name]         SYSNAME        NULL
   , [allow_partition_switch] BIT            NOT NULL
-  , [ErrorMessage]           NVARCHAR(MAX) NULL
+  , [ErrorMessage]           NVARCHAR(MAX)  NULL
 );
 
 CREATE TABLE [#PublicationsArticles]
@@ -733,6 +753,7 @@ INSERT INTO [#SchemaBoundViews]
         [ReferencingObjectId]
       , [ReferencingObjectSchema]
       , [ReferencingObjectName]
+      , [IsEncrypted]
       , [DropViewCommand]
       , [RecreateViewCommand]
     )
@@ -740,6 +761,7 @@ SELECT DISTINCT
        [sed].[referencing_id] AS [ReferencingObjectId]
      , SCHEMA_NAME([ss].[schema_id]) AS [ReferencingObjectSchema]
      , OBJECT_NAME([vid].[object_id]) AS [ReferencingObjectName]
+     , OBJECTPROPERTY([vid].[object_id], 'IsEncrypted') AS [IsEncrypted]
      , CONCAT('DROP VIEW ', QUOTENAME(SCHEMA_NAME([ss].[schema_id])), '.', QUOTENAME(OBJECT_NAME([vid].[object_id]))) AS [DropViewCommand]
      , [sqm].[definition] AS [RecreateViewCommand]
 FROM sys.sql_expression_dependencies AS [sed]
@@ -776,7 +798,8 @@ OUTER APPLY (
                 INNER JOIN sys.columns AS [col]
                     ON [obj].[object_id] = [col].[object_id]
                 WHERE [obj].[object_id] = [sbv].[ReferencingObjectId]
-            ) AS [Xtp];
+            ) AS [Xtp]
+WHERE [sbv].[IsEncrypted] = 0;
 
 SELECT @CountSchBvFound = COUNT([Id]) FROM [#SchemaBoundViews];
 PRINT (CONCAT(N'/* Found: ', @CountSchBvFound, ' Schema-Bound Views Referencing ', @CountTablesSelected, ' tables selected for truncation in : [', DB_NAME(DB_ID()), N'] database */'));
@@ -787,7 +810,6 @@ BEGIN
 END;
 ELSE
 BEGIN
-    TRUNCATE TABLE [#SbvToSelTablesLink];
     INSERT INTO [#SbvToSelTablesLink] ([ReferencingObjectId], [ReferncedObjectId])
     SELECT DISTINCT
            [sbv].[ReferencingObjectId]
@@ -845,7 +867,7 @@ BEGIN
 
     PRINT ('/*--------------------------------------- UPDATING [XtdProperties] of [#SchemaBoundViews]: -----------------------*/');
 
-    SELECT @Id = MIN([Id]), @IdMax = MAX([Id]) FROM [#SchemaBoundViews];
+    SELECT @Id = MIN([Id]), @IdMax = MAX([Id]) FROM [#SchemaBoundViews] WHERE [IsEncrypted] = 0;
     WHILE (@Id <= @IdMax)
     BEGIN
         SELECT @level0type = [@level0type]
@@ -901,7 +923,7 @@ BEGIN
         END;
 
         SET @SqlXtndProperties = NULL;
-        SELECT @Id = COALESCE(MIN([Id]), @Id + 1) FROM [#SchemaBoundViews] WHERE [Id] > @Id;
+        SELECT @Id = COALESCE(MIN([Id]), @Id + 1) FROM [#SchemaBoundViews] WHERE [Id] > @Id AND [IsEncrypted] = 0;
         IF  (@Id < @IdMax) AND @WhatIf <> 1
         AND (@Id * 100) / @IdMax <> @PercentProcessed AND @WhatIf <> 1
         BEGIN
@@ -909,6 +931,41 @@ BEGIN
             PRINT (CONCAT(@PercentProcessed, ' percent processed.'));
         END;
     END;
+
+    PRINT ('/*--------------------------------------- POPULATING [#IndexesOnSchemaBoundViews]: -----------------------*/');
+    
+    INSERT INTO [#IndexesOnSchemaBoundViews] ([ReferencedViewObjectId], [IndexId], [IsUnique], [IndexType], [IndexName], [OnView], [ColumnNames])
+    SELECT 
+           [v].[object_id]                                    AS [ReferencedViewObjectId]
+         , [i].[index_id]                                     AS [IndexId]
+         /* , 'CREATE ' */
+         , IIF([i].[is_unique] = 1, 'UNIQUE ', '')            AS [IsUnique]
+         , [i].[type_desc]                                    AS [IndexType]
+         /* , ' INDEX ' */
+         , QUOTENAME([i].[name])                              AS [IndexName]
+         , CONCAT('ON ', QUOTENAME([v].[name]))               AS [OnView]
+         , CONCAT('(', STRING_AGG(QUOTENAME([c].[name]), ', ')WITHIN GROUP(ORDER BY [ic].[key_ordinal]), ')') AS [ColumnNames]
+    FROM sys.indexes [i]
+    JOIN sys.views [v]
+        ON [i].[object_id] = [v].[object_id]
+    JOIN [#SchemaBoundViews] AS [sbv]
+        ON [sbv].[ReferencingObjectId] = [v].[object_id]
+    JOIN sys.index_columns [ic]
+        ON  [i].[object_id] = [ic].[object_id]
+        AND [i].[index_id] = [ic].[index_id]
+    JOIN sys.columns [c]
+        ON  [ic].[object_id] = [c].[object_id]
+        AND [ic].[column_id] = [c].[column_id]
+    WHERE [i].[is_hypothetical] = 0
+    AND   [sbv].[IsEncrypted] = 0
+    GROUP BY [v].[object_id]
+           , [v].[name]
+           , [i].[index_id]
+           , [i].[name]
+           , [i].[type_desc]
+           , [i].[is_unique]
+    ORDER BY [v].[object_id]
+           , [i].[index_id]
 END;
 
 PRINT ('/*--------------------------------------- UPDATING [IsCDCEnabled] flag of [#SelectedTables]: ---------------------*/');
@@ -1313,6 +1370,7 @@ BEGIN
         IF (@WhatIf = 1)
         BEGIN
             PRINT(@SqlDropView);
+            UPDATE [#SchemaBoundViews] SET [Dropped] = 1 WHERE [Id] = @Id
         END;
         ELSE
         BEGIN TRY
@@ -1320,6 +1378,9 @@ BEGIN
             IF (@@ERROR = 0) 
             BEGIN
                 SELECT @CountSchBvDropped = @CountSchBvDropped + 1;
+                
+                UPDATE [#SchemaBoundViews] SET [Dropped] = 1 WHERE [Id] = @Id
+
                 -- update NumSchBvDropped:
                 UPDATE [st]
                 SET [st].[NumSchBvDropped] = COALESCE([st].[NumSchBvDropped], 0) + 1
@@ -1877,120 +1938,148 @@ BEGIN
     SELECT @Id = MIN([Id]), @IdMax = MAX([Id]) FROM [#SchemaBoundViews];
     WHILE (@Id <= @IdMax)
     BEGIN
-        SELECT @SqlRecreateView = [RecreateViewCommand] FROM [#SchemaBoundViews] WHERE [Id] = @Id;
+        SELECT  @SchBvName = [ReferencingObjectName]
+              , @SqlRecreateView = [RecreateViewCommand] 
+              , @IsEncrypted = [IsEncrypted]
+        FROM    [#SchemaBoundViews] 
+        WHERE   [Id] = @Id;
         
-        IF (@SqlRecreateView IS NOT NULL) AND (@WhatIf = 1)
+        IF (@IsEncrypted = 1 AND @SqlRecreateView IS NULL)
         BEGIN
-            PRINT(@SqlRecreateView);
-            PRINT('GO');
-        END;
-        ELSE         
-        BEGIN TRY            
-
-            IF (@ContinueOnError = 1 AND XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
+            SELECT @ErrorMessage = CONCAT('Definition of Schema-Bound View: ', QUOTENAME(@SchBvName), ' is encrypted, unable to recreate it');
+            IF (@WhatIf = 1)
+            BEGIN 
+                PRINT(CONCAT('/* !!! Warning: ', @ErrorMessage, ' */'))
+            END
+            ELSE 
             BEGIN
-                COMMIT TRANSACTION;
-                BEGIN TRANSACTION;
-            END;
-            EXEC sys.sp_executesql @stmt = @SqlRecreateView;
-            IF (@ContinueOnError = 1 AND XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
-            BEGIN
-                COMMIT TRANSACTION;
-                BEGIN TRANSACTION;
-            END;            
-            IF (@@ERROR = 0 AND @ErrorMessage IS NULL) 
-            BEGIN
-                SELECT @CountSchBvRecreated = @CountSchBvRecreated + 1;
-                
-                UPDATE [st]
-                SET [st].[NumSchBvRecreated] = COALESCE([st].[NumSchBvRecreated], 0) + 1
-                FROM [#SelectedTables] AS [st]
-                WHERE [IsToBeTruncated] = 1 
-                AND EXISTS (
-                                 SELECT 1
-                                 FROM [#SbvToSelTablesLink] AS [sbvcr]
-                                 JOIN [#SchemaBoundViews] AS [sbv]
-                                     ON  [sbvcr].[ReferencingObjectId] = [sbv].[ReferencingObjectId]
-                                     AND [sbvcr].[ReferncedObjectId] = [st].[ObjectID]
-                                     AND [sbv].[Id] = @Id
-                             );
-            END;
-        END TRY
-        BEGIN CATCH 
-              SET @ErrorMessage = CONCAT(ERROR_MESSAGE(), ' when executing: ', @SqlRecreateView);
-              IF (@ContinueOnError <> 1)
-                  GOTO ERROR;
-              ELSE /* continue execution but log the error: */
-              BEGIN
-                RAISERROR(@ErrorMessage, @ErrorSeverity11, 1) WITH NOWAIT;                
-                IF (XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
+                IF (@ContinueOnError <> 1) GOTO ERROR
+                ELSE 
                 BEGIN
-                    ROLLBACK TRANSACTION;
-                    BEGIN TRANSACTION;
-                END;
-                
-                SET @ParamDefinition = '@_ErrorMessage NVARCHAR(4000), @_Id INT';
-                SET @SqlLogError = 'UPDATE [#SchemaBoundViews] SET [ErrorMessage] = CONCAT([ErrorMessage]+''; '', @_ErrorMessage) WHERE [Id] = @_Id';
-                EXEC sys.sp_executesql @stmt = @SqlLogError, @params = @ParamDefinition, @_ErrorMessage = @ErrorMessage, @_Id = @Id;
-                
-                IF (XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
+                        RAISERROR(@ErrorMessage, @ErrorSeverity11, 1) WITH NOWAIT;  
+                        SET @ParamDefinition = '@_ErrorMessage NVARCHAR(4000), @_Id INT';
+                        SET @SqlLogError = 'UPDATE [#SchemaBoundViews] SET [ErrorMessage] = CONCAT([ErrorMessage]+''; '', @_ErrorMessage) WHERE [Id] = @_Id';
+                        EXEC sys.sp_executesql @stmt = @SqlLogError, @params = @ParamDefinition, @_ErrorMessage = @ErrorMessage, @_Id = @Id;
+                END            
+            END 
+        END
+        ELSE 
+        BEGIN               
+            IF (@WhatIf = 1)
+            BEGIN
+                PRINT(@SqlRecreateView);
+                PRINT('GO');
+                UPDATE [#SchemaBoundViews] SET [Recreated] = 1 WHERE [Id] = @Id
+            END;
+            ELSE         
+            BEGIN TRY            
+
+                IF (@ContinueOnError = 1 AND XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
                 BEGIN
                     COMMIT TRANSACTION;
                     BEGIN TRANSACTION;
                 END;
-                SET @ErrorMessage = NULL;
-              END;
-        END CATCH; 
-        
-
-        SELECT @SqlXtndProperties = [XtdProperties] FROM [#SchemaBoundViews] WHERE [Id] = @Id;
-
-        IF (@SqlXtndProperties IS NOT NULL) AND (@WhatIf = 1)
-        BEGIN
-            PRINT(@SqlXtndProperties);
-            PRINT('GO');
-        END;
-        ELSE
-        BEGIN TRY            
-
-            IF (@ContinueOnError = 1 AND XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
-            BEGIN
-                COMMIT TRANSACTION;
-                BEGIN TRANSACTION;
-            END;
-            EXEC sys.sp_executesql @stmt = @SqlXtndProperties;
-            IF (@ContinueOnError = 1 AND XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
-            BEGIN
-                COMMIT TRANSACTION;
-                BEGIN TRANSACTION;
-            END;
-        END TRY
-        BEGIN CATCH 
-              SET @ErrorMessage = CONCAT(ERROR_MESSAGE(), ' when executing: ', @SqlXtndProperties);
-              IF (@ContinueOnError <> 1)
-                  GOTO ERROR;
-              ELSE /* continue execution but log the error: */
-              BEGIN
-                RAISERROR(@ErrorMessage, @ErrorSeverity11, 1) WITH NOWAIT;                
-                IF (XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
+                EXEC sys.sp_executesql @stmt = @SqlRecreateView;
+                IF (@ContinueOnError = 1 AND XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
                 BEGIN
-                    ROLLBACK TRANSACTION;
+                    COMMIT TRANSACTION;
                     BEGIN TRANSACTION;
+                END;            
+                IF (@@ERROR = 0 AND @ErrorMessage IS NULL) 
+                BEGIN
+                    SELECT @CountSchBvRecreated = @CountSchBvRecreated + 1;
+                    
+                    UPDATE [#SchemaBoundViews] SET [Recreated] = 1 WHERE [Id] = @Id
+                    
+                    UPDATE [st]
+                    SET [st].[NumSchBvRecreated] = COALESCE([st].[NumSchBvRecreated], 0) + 1
+                    FROM [#SelectedTables] AS [st]
+                    WHERE [IsToBeTruncated] = 1 
+                    AND EXISTS (
+                                     SELECT 1
+                                     FROM [#SbvToSelTablesLink] AS [sbvcr]
+                                     JOIN [#SchemaBoundViews] AS [sbv]
+                                         ON  [sbvcr].[ReferencingObjectId] = [sbv].[ReferencingObjectId]
+                                         AND [sbvcr].[ReferncedObjectId] = [st].[ObjectID]
+                                         AND [sbv].[Id] = @Id
+                                 );
                 END;
-                
-                SET @ParamDefinition = '@_ErrorMessage NVARCHAR(4000), @_Id INT';
-                SET @SqlLogError = 'UPDATE [#SchemaBoundViews] SET [ErrorMessage] = CONCAT([ErrorMessage]+''; '', @_ErrorMessage) WHERE [Id] = @_Id';
-                EXEC sys.sp_executesql @stmt = @SqlLogError, @params = @ParamDefinition, @_ErrorMessage = @ErrorMessage, @_Id = @Id;
-                
-                IF (XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
+            END TRY
+            BEGIN CATCH 
+                  SET @ErrorMessage = CONCAT(ERROR_MESSAGE(), ' when executing: ', @SqlRecreateView);
+                  IF (@ContinueOnError <> 1)
+                      GOTO ERROR;
+                  ELSE /* continue execution but log the error: */
+                  BEGIN
+                    RAISERROR(@ErrorMessage, @ErrorSeverity11, 1) WITH NOWAIT;                
+                    IF (XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
+                    BEGIN
+                        ROLLBACK TRANSACTION;
+                        BEGIN TRANSACTION;
+                    END;
+                    
+                    SET @ParamDefinition = '@_ErrorMessage NVARCHAR(4000), @_Id INT';
+                    SET @SqlLogError = 'UPDATE [#SchemaBoundViews] SET [ErrorMessage] = CONCAT([ErrorMessage]+''; '', @_ErrorMessage) WHERE [Id] = @_Id';
+                    EXEC sys.sp_executesql @stmt = @SqlLogError, @params = @ParamDefinition, @_ErrorMessage = @ErrorMessage, @_Id = @Id;
+                    
+                    IF (XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
+                    BEGIN
+                        COMMIT TRANSACTION;
+                        BEGIN TRANSACTION;
+                    END;
+                    SET @ErrorMessage = NULL;
+                  END;
+            END CATCH; 
+            
+
+            SELECT @SqlXtndProperties = [XtdProperties] FROM [#SchemaBoundViews] WHERE [Id] = @Id;
+
+            IF (@SqlXtndProperties IS NOT NULL) AND (@WhatIf = 1)
+            BEGIN
+                PRINT(@SqlXtndProperties);
+                PRINT('GO');
+            END;
+            ELSE
+            BEGIN TRY
+                IF (@ContinueOnError = 1 AND XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
                 BEGIN
                     COMMIT TRANSACTION;
                     BEGIN TRANSACTION;
                 END;
-                SET @ErrorMessage = NULL;
-              END;
-        END CATCH; 
-
+                EXEC sys.sp_executesql @stmt = @SqlXtndProperties;
+                IF (@ContinueOnError = 1 AND XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
+                BEGIN
+                    COMMIT TRANSACTION;
+                    BEGIN TRANSACTION;
+                END;
+            END TRY
+            BEGIN CATCH 
+                  SET @ErrorMessage = CONCAT(ERROR_MESSAGE(), ' when executing: ', @SqlXtndProperties);
+                  IF (@ContinueOnError <> 1)
+                      GOTO ERROR;
+                  ELSE /* continue execution but log the error: */
+                  BEGIN
+                    RAISERROR(@ErrorMessage, @ErrorSeverity11, 1) WITH NOWAIT;                
+                    IF (XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
+                    BEGIN
+                        ROLLBACK TRANSACTION;
+                        BEGIN TRANSACTION;
+                    END;
+                    
+                    SET @ParamDefinition = '@_ErrorMessage NVARCHAR(4000), @_Id INT';
+                    SET @SqlLogError = 'UPDATE [#SchemaBoundViews] SET [ErrorMessage] = CONCAT([ErrorMessage]+''; '', @_ErrorMessage) WHERE [Id] = @_Id';
+                    EXEC sys.sp_executesql @stmt = @SqlLogError, @params = @ParamDefinition, @_ErrorMessage = @ErrorMessage, @_Id = @Id;
+                    
+                    IF (XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
+                    BEGIN
+                        COMMIT TRANSACTION;
+                        BEGIN TRANSACTION;
+                    END;
+                    SET @ErrorMessage = NULL;
+                  END;
+            END CATCH;
+        END;
+        
         SELECT @Id = COALESCE(MIN([Id]), @Id + 1) FROM [#SchemaBoundViews] WHERE [Id] > @Id;
         IF  (@Id < @IdMax) AND (@Id * 100) / @IdMax <> @PercentProcessed AND @WhatIf <> 1
         BEGIN
@@ -2025,6 +2114,87 @@ BEGIN
         IF (@WhatIf <> 1) PRINT (CONCAT('/* Successfully recreated: ', COALESCE(@CountSchBvRecreated, 0), ' Schema-Bound Views (matches the number of Schema-Bound Views previously Dropped). */'));
     END;
     PRINT ('/*--------------------------------------- END OF RECREATING SCHEMA-BOUND VIEWS -----------------------------------*/');
+
+    
+    IF EXISTS (
+                SELECT 1 FROM [#IndexesOnSchemaBoundViews] AS [isbv]
+                JOIN [#SchemaBoundViews] AS [sbv] ON [sbv].[ReferencingObjectId] = [isbv].[ReferencedViewObjectId]
+                WHERE [sbv].[Recreated] = 1
+              )
+    BEGIN
+        PRINT ('/*--------------------------------------- RECREATING INDEXES ON SCHEMA-BOUND VIEWS: -----------------------------------------*/');
+
+        SELECT @Id = MIN([isbv].[Id]), @IdMax = MAX([isbv].[Id])
+        FROM [#IndexesOnSchemaBoundViews] AS [isbv]
+        JOIN [#SchemaBoundViews] AS [sbv]
+            ON [sbv].[ReferencingObjectId] = [isbv].[ReferencedViewObjectId]
+        WHERE [sbv].[Recreated] = 1;
+    
+        WHILE (@Id <= @IdMax)
+        BEGIN
+            SELECT @SqlRecreateIdxOnSchBv = CONCAT(
+                   'CREATE ' 
+                 , [IsUnique]
+                 , [IndexType]
+                 , ' INDEX ' 
+                 , [IndexName], ' '
+                 , [OnView]
+                 , [ColumnNames]
+            ) 
+            FROM [#IndexesOnSchemaBoundViews] WHERE [Id] = @Id;
+        
+            IF (@WhatIf = 1)
+            BEGIN
+                PRINT(@SqlRecreateIdxOnSchBv);
+                PRINT('GO');
+            END
+            ELSE 
+            BEGIN TRY
+                IF (@ContinueOnError = 1 AND XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
+                BEGIN
+                    COMMIT TRANSACTION;
+                    BEGIN TRANSACTION;
+                END;
+                EXEC sys.sp_executesql @stmt = @SqlRecreateIdxOnSchBv;
+                IF (@ContinueOnError = 1 AND XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
+                BEGIN
+                    COMMIT TRANSACTION;
+                    BEGIN TRANSACTION;
+                END;
+            END TRY
+            BEGIN CATCH 
+                  SET @ErrorMessage = CONCAT(ERROR_MESSAGE(), ' when executing: ', @SqlRecreateIdxOnSchBv);
+                  IF (@ContinueOnError <> 1)
+                      GOTO ERROR;
+                  ELSE /* continue execution but log the error: */
+                  BEGIN
+                    RAISERROR(@ErrorMessage, @ErrorSeverity11, 1) WITH NOWAIT;                
+                    IF (XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
+                    BEGIN
+                        ROLLBACK TRANSACTION;
+                        BEGIN TRANSACTION;
+                    END;
+                    
+                    SET @ParamDefinition = '@_ErrorMessage NVARCHAR(4000), @_Id INT';
+                    SET @SqlLogError = 'UPDATE [#IndexesOnSchemaBoundViews] SET [ErrorMessage] = CONCAT([ErrorMessage]+''; '', @_ErrorMessage) WHERE [Id] = @_Id';
+                    EXEC sys.sp_executesql @stmt = @SqlLogError, @params = @ParamDefinition, @_ErrorMessage = @ErrorMessage, @_Id = @Id;
+                    
+                    IF (XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
+                    BEGIN
+                        COMMIT TRANSACTION;
+                        BEGIN TRANSACTION;
+                    END;
+                    SET @ErrorMessage = NULL;
+                  END;
+            END CATCH; 
+        
+            SELECT @Id = MIN([isbv].[Id])
+            FROM [#IndexesOnSchemaBoundViews] AS [isbv]
+            JOIN [#SchemaBoundViews] AS [sbv]
+                ON [sbv].[ReferencingObjectId] = [isbv].[ReferencedViewObjectId]
+            WHERE [sbv].[Recreated] = 1 AND [isbv].[Id] > @Id;
+        END
+    END
 END;
 
 
