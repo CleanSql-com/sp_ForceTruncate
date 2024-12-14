@@ -32,6 +32,7 @@ ALTER PROCEDURE [dbo].[sp_ForceTruncate]
 /* 2024-12-12  CleanSql.com    1.02      improved @TableNames validation and error handling,                            */
 /*                                       added support for [#IndexesOnSchemaBoundViews], encrypted SchBv error-handling */
 /*                                       and for [#TriggerssOnSchemaBoundViews] + encrypted Trgr error-handling         */
+/* 2024-12-12  CleanSql.com    1.03      fixed bug: missing schema in ON clause populating [#IndexesOnSchemaBoundViews] */
 /* -------------------------------------------------------------------------------------------------------------------- */
 /* ==================================================================================================================== */
 /* Example use:
@@ -86,7 +87,7 @@ DECLARE
 /* ==================================================================================================================== */
 
   /* Internal parameters: */
-    @SpCurrentVersion                CHAR(5) = '1.02'
+    @SpCurrentVersion                CHAR(5) = '1.03'
   , @ObjectId                        BIGINT
   , @SchemaId                        INT
   , @StartSearchSch                  INT
@@ -968,18 +969,20 @@ BEGIN
     
     INSERT INTO [#IndexesOnSchemaBoundViews] ([ReferencedViewObjectId], [IndexId], [IsUnique], [IndexType], [IndexName], [OnView], [ColumnNames])
     SELECT 
-           [v].[object_id]                                    AS [ReferencedViewObjectId]
-         , [i].[index_id]                                     AS [IndexId]
+           [v].[object_id]                                                                                    AS [ReferencedViewObjectId]
+         , [i].[index_id]                                                                                     AS [IndexId]
          /* , 'CREATE ' */
-         , IIF([i].[is_unique] = 1, 'UNIQUE ', '')            AS [IsUnique]
-         , [i].[type_desc]                                    AS [IndexType]
+         , IIF([i].[is_unique] = 1, 'UNIQUE ', '')                                                            AS [IsUnique]
+         , [i].[type_desc]                                                                                    AS [IndexType]
          /* , ' INDEX ' */
-         , QUOTENAME([i].[name])                              AS [IndexName]
-         , CONCAT('ON ', QUOTENAME([v].[name]))               AS [OnView]
+         , QUOTENAME([i].[name])                                                                              AS [IndexName]
+         , CONCAT('ON ', QUOTENAME([ss].[name]), '.', QUOTENAME([v].[name]))                                  AS [OnView]
          , CONCAT('(', STRING_AGG(QUOTENAME([c].[name]), ', ')WITHIN GROUP(ORDER BY [ic].[key_ordinal]), ')') AS [ColumnNames]
     FROM sys.indexes [i]
     JOIN sys.views [v]
         ON [i].[object_id] = [v].[object_id]
+    JOIN sys.schemas AS [ss]
+        ON [ss].[schema_id] = [v].[schema_id]
     JOIN [#SchemaBoundViews] AS [sbv]
         ON [sbv].[SbvObjectId] = [v].[object_id]
     JOIN sys.index_columns [ic]
@@ -992,6 +995,7 @@ BEGIN
     AND   [sbv].[IsEncrypted] = 0
     GROUP BY [v].[object_id]
            , [v].[name]
+           , [ss].[name]
            , [i].[index_id]
            , [i].[name]
            , [i].[type_desc]
@@ -2027,7 +2031,7 @@ BEGIN
         
         IF (@IsEncrypted = 1 AND @SqlRecreateView IS NULL)
         BEGIN
-            SELECT @ErrorMessage = CONCAT('Definition of Schema-Bound View: ', QUOTENAME(@SchBvName), ' is encrypted, unable to recreate this view any indexes/triggers depending on it');
+            SELECT @ErrorMessage = CONCAT('Definition of Schema-Bound View: ', QUOTENAME(@SchBvName), ' is encrypted, unable to recreate this view and any indexes/triggers depending on it');
             IF (@WhatIf = 1)
             BEGIN 
                 PRINT(CONCAT('/* !!! Warning: ', @ErrorMessage, ' */'))
@@ -2381,7 +2385,7 @@ BEGIN
             END CATCH
             ELSE IF (@WhatIf = 1)
             BEGIN
-                PRINT(@SqlRecreateTrgOnSchBv);
+                PRINT(CONCAT(@SqlRecreateTrgOnSchBv, 'GO'));
             END 
 
             SET @SqlRecreateTrgOnSchBv = NULL
