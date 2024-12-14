@@ -31,6 +31,7 @@ ALTER PROCEDURE [dbo].[sp_ForceTruncate]
 /*                                       using sys.tables for @TruncateAllTablesPerDB instead of INFORMATION_SCHEMA     */
 /* 2024-12-12  CleanSql.com    1.02      improved @TableNames validation and error handling,                            */
 /*                                       added support for [#IndexesOnSchemaBoundViews], encrypted SchBv error-handling */
+/*                                       and for [#TriggerssOnSchemaBoundViews] + encrypted Trgr error-handling         */
 /* -------------------------------------------------------------------------------------------------------------------- */
 /* ==================================================================================================================== */
 /* Example use:
@@ -101,6 +102,16 @@ DECLARE
   , @PercentProcessed                INT           = 0
   , @IsDbCDCEnabled                  BIT
 
+  /* Trigger parsing variables: */
+  , @TriggerId           INT
+  , @TriggerName         SYSNAME
+  , @TriggerDefinition   NVARCHAR(MAX)
+  , @PointerString       INT
+  , @PointerNewLine      INT
+  , @LineOfCode          NVARCHAR(MAX)
+  , @LineOfCodeId        INT
+  , @LineOfCodeIdMax     INT
+
   /* error handling variables: */
   , @ErrorMessage                    NVARCHAR(MAX)
   , @ErrorSeverity11                 INT           = 11     /* 11 changes the message color to red */
@@ -113,12 +124,14 @@ DECLARE
   , @SqlObjectId                     NVARCHAR(MAX)
   , @SqlDropConstraint               NVARCHAR(MAX)
   , @SqlDropView                     NVARCHAR(MAX)
+  , @SqlTriggerDefinition            NVARCHAR(MAX)
   , @SqlTruncateTable                NVARCHAR(MAX)
   , @SqlUpdateStatistics             NVARCHAR(MAX)
   , @SqlRecreateConstraint           NVARCHAR(MAX)
   , @SqlRecreateView                 NVARCHAR(MAX)
   , @SqlXtndProperties               NVARCHAR(MAX)
   , @SqlRecreateIdxOnSchBv           NVARCHAR(MAX)
+  , @SqlRecreateTrgOnSchBv           NVARCHAR(MAX)
   , @SqlReenableCDCInstance          NVARCHAR(MAX)
   , @SqlTableCounts                  NVARCHAR(MAX)
   , @SqlSetIsTruncated               NVARCHAR(MAX)
@@ -198,7 +211,7 @@ CREATE TABLE [#SelectedTables]
 (
     [Id]                    INT           NOT NULL PRIMARY KEY CLUSTERED IDENTITY(1, 1)
   , [SchemaID]              INT           NOT NULL
-  , [ObjectID]              BIGINT        NOT NULL UNIQUE
+  , [ObjectID]              INT           NOT NULL UNIQUE
   , [SchemaName]            SYSNAME       NOT NULL
   , [TableName]             SYSNAME       NOT NULL
   , [IsReferencedByFk]      BIT           NULL
@@ -232,7 +245,7 @@ CREATE TABLE [#ForeignKeyConstraintDefinitions]
     [Id]                        INT           NOT NULL PRIMARY KEY CLUSTERED IDENTITY(1, 1)
   , [ForeignKeyId]              INT           NOT NULL UNIQUE
   , [ForeignKeyName]            SYSNAME       NOT NULL
-  , [ObjectIdTrgt]              BIGINT        NOT NULL
+  , [ObjectIdTrgt]              INT           NOT NULL
   , [SchemaNameSrc]             SYSNAME       NOT NULL
   , [TableNameSrc]              SYSNAME       NOT NULL
   , [SchemaNameTrgt]            SYSNAME       NOT NULL
@@ -245,7 +258,7 @@ CREATE TABLE [#ForeignKeyConstraintDefinitions]
 CREATE TABLE [#TableRowCounts]
 (
     [Id]        INT          NOT NULL PRIMARY KEY CLUSTERED IDENTITY(1, 1)
-  , [ObjectID]  BIGINT       NOT NULL UNIQUE 
+  , [ObjectID]  INT          NOT NULL UNIQUE 
   , [TableName] VARCHAR(256) NOT NULL
   , [RowCount]  BIGINT       NOT NULL
 );
@@ -253,7 +266,7 @@ CREATE TABLE [#TableRowCounts]
 CREATE TABLE [#SchemaBoundViews]
 (
     [Id]                      INT           NOT NULL PRIMARY KEY CLUSTERED IDENTITY(1, 1)
-  , [ReferencingObjectId]     BIGINT        NOT NULL UNIQUE
+  , [SbvObjectId]             INT           NOT NULL UNIQUE
   , [ReferencingObjectSchema] NVARCHAR(128) NOT NULL
   , [ReferencingObjectName]   NVARCHAR(128) NOT NULL
   , [DropViewCommand]         NVARCHAR(MAX) NOT NULL
@@ -269,7 +282,7 @@ CREATE TABLE [#SchemaBoundViews]
   , [ErrorMessage]            NVARCHAR(MAX) NULL
 );
 
-CREATE TABLE [#SbvToSelTablesLink] ([ReferencingObjectId] BIGINT NOT NULL, [ReferncedObjectId] BIGINT NOT NULL);
+CREATE TABLE [#SbvToSelTablesLink] ([SbvObjectId] INT NOT NULL, [ReferncedObjectId] INT NOT NULL);
 
 CREATE TABLE [#IndexesOnSchemaBoundViews]
 (
@@ -284,11 +297,30 @@ CREATE TABLE [#IndexesOnSchemaBoundViews]
   , UNIQUE ([ReferencedViewObjectId], [IndexId])
 );
 
+CREATE TABLE [#TriggersOnSchemaBoundViews]
+(
+    [Id]                     INT           NOT NULL PRIMARY KEY CLUSTERED IDENTITY(1, 1)
+  , [ReferencedViewObjectId] INT           NOT NULL
+  , [TriggerId]              INT           NOT NULL
+  , [TriggerName]            SYSNAME       NOT NULL
+  , [IsEncrypted]            BIT           NOT NULL
+  , [ErrorMessage]           NVARCHAR(MAX) NULL
+  , UNIQUE ([TriggerId])
+);
+
+CREATE TABLE [#TriggerDefinitions]
+(
+    [TriggerId]  INT           NOT NULL
+  , [LineId]     INT           IDENTITY(1, 1) NOT NULL
+  , [LineOfCode] NVARCHAR(MAX) NOT NULL
+  , PRIMARY KEY CLUSTERED ([TriggerId], [LineId])
+);
+
 CREATE TABLE [#CDCInstances]
 (
     [Id]                     INT            NOT NULL PRIMARY KEY CLUSTERED IDENTITY(1, 1)
-  , [ReferencingObjectId]    BIGINT         NOT NULL UNIQUE
-  , [ReferncedObjectId]      BIGINT         NOT NULL
+  , [CdcObjectId]            INT            NOT NULL UNIQUE
+  , [ReferncedObjectId]      INT            NOT NULL
   , [source_schema]          SYSNAME        NOT NULL
   , [source_name]            SYSNAME        NOT NULL
   , [capture_instance]       SYSNAME        NOT NULL
@@ -750,7 +782,7 @@ PRINT ('/*--------------------------------------- POPULATING [#SchemaBoundViews]
 TRUNCATE TABLE [#SchemaBoundViews];
 INSERT INTO [#SchemaBoundViews]
     (
-        [ReferencingObjectId]
+        [SbvObjectId]
       , [ReferencingObjectSchema]
       , [ReferencingObjectName]
       , [IsEncrypted]
@@ -758,7 +790,7 @@ INSERT INTO [#SchemaBoundViews]
       , [RecreateViewCommand]
     )
 SELECT DISTINCT
-       [sed].[referencing_id] AS [ReferencingObjectId]
+       [sed].[referencing_id] AS [SbvObjectId]
      , SCHEMA_NAME([ss].[schema_id]) AS [ReferencingObjectSchema]
      , OBJECT_NAME([vid].[object_id]) AS [ReferencingObjectName]
      , OBJECTPROPERTY([vid].[object_id], 'IsEncrypted') AS [IsEncrypted]
@@ -797,7 +829,7 @@ OUTER APPLY (
                     ON [obj].[schema_id] = [sch].[schema_id]
                 INNER JOIN sys.columns AS [col]
                     ON [obj].[object_id] = [col].[object_id]
-                WHERE [obj].[object_id] = [sbv].[ReferencingObjectId]
+                WHERE [obj].[object_id] = [sbv].[SbvObjectId]
             ) AS [Xtp]
 WHERE [sbv].[IsEncrypted] = 0;
 
@@ -810,13 +842,13 @@ BEGIN
 END;
 ELSE
 BEGIN
-    INSERT INTO [#SbvToSelTablesLink] ([ReferencingObjectId], [ReferncedObjectId])
+    INSERT INTO [#SbvToSelTablesLink] ([SbvObjectId], [ReferncedObjectId])
     SELECT DISTINCT
-           [sbv].[ReferencingObjectId]
+           [sbv].[SbvObjectId]
          , [sed].[referenced_id] AS [ReferncedObjectId]
     FROM [#SchemaBoundViews] AS [sbv]
     JOIN sys.sql_expression_dependencies AS [sed]
-        ON [sed].[referencing_id] = [sbv].[ReferencingObjectId]
+        ON [sed].[referencing_id] = [sbv].[SbvObjectId]
     JOIN [#SelectedTables] AS [st]
         ON [st].[ObjectID] = [sed].[referenced_id]
         AND [st].[IsToBeTruncated] = 1;
@@ -832,10 +864,10 @@ BEGIN
     SET [st].[NumSchBvReferencing] = [Sbv].[ReferencingObjCnt]
     FROM [#SelectedTables] AS [st]
     CROSS APPLY (
-                   SELECT COUNT(DISTINCT [sbvcr].[ReferencingObjectId]) AS [ReferencingObjCnt]
+                   SELECT COUNT(DISTINCT [sbvcr].[SbvObjectId]) AS [ReferencingObjCnt]
                    FROM [#SbvToSelTablesLink] AS [sbvcr]
                    JOIN [#SchemaBoundViews] AS [sbv]
-                       ON [sbvcr].[ReferencingObjectId] = [sbv].[ReferencingObjectId]
+                       ON [sbvcr].[SbvObjectId] = [sbv].[SbvObjectId]
                        AND [sbvcr].[ReferncedObjectId] = [st].[ObjectID]
                        AND [st].[IsToBeTruncated] = 1
                ) [Sbv];
@@ -932,7 +964,7 @@ BEGIN
         END;
     END;
 
-    PRINT ('/*--------------------------------------- POPULATING [#IndexesOnSchemaBoundViews]: -----------------------*/');
+    PRINT ('/*--------------------------------------- POPULATING [#IndexesOnSchemaBoundViews]: -------------------------------*/');
     
     INSERT INTO [#IndexesOnSchemaBoundViews] ([ReferencedViewObjectId], [IndexId], [IsUnique], [IndexType], [IndexName], [OnView], [ColumnNames])
     SELECT 
@@ -949,7 +981,7 @@ BEGIN
     JOIN sys.views [v]
         ON [i].[object_id] = [v].[object_id]
     JOIN [#SchemaBoundViews] AS [sbv]
-        ON [sbv].[ReferencingObjectId] = [v].[object_id]
+        ON [sbv].[SbvObjectId] = [v].[object_id]
     JOIN sys.index_columns [ic]
         ON  [i].[object_id] = [ic].[object_id]
         AND [i].[index_id] = [ic].[index_id]
@@ -965,7 +997,56 @@ BEGIN
            , [i].[type_desc]
            , [i].[is_unique]
     ORDER BY [v].[object_id]
-           , [i].[index_id]
+           , [i].[index_id];
+
+    PRINT ('/*--------------------------------------- POPULATING [#TriggersOnSchemaBoundViews]: ------------------------------*/');
+
+    INSERT INTO [#TriggersOnSchemaBoundViews] ([ReferencedViewObjectId], [TriggerId], [TriggerName], [IsEncrypted])
+    SELECT [tr].[parent_id] AS [ReferencedViewObjectId]
+         , [tr].[object_id] AS [TriggerId]
+         , QUOTENAME(OBJECT_NAME([tr].[object_id])) AS [TriggerName]
+         , OBJECTPROPERTY([tr].[object_id], 'IsEncrypted') AS [IsEncrypted]
+    FROM sys.triggers [tr]
+    JOIN [#SchemaBoundViews] AS [sbv]
+        ON [sbv].[SbvObjectId] = [tr].[parent_id];
+
+    IF EXISTS (SELECT 1 FROM [#TriggersOnSchemaBoundViews] WHERE [IsEncrypted] = 0)
+    BEGIN
+        PRINT ('/*--------------------------------------- POPULATING [#TriggerDefinitions]: --------------------------------------*/');
+
+        SELECT @Id = MIN([Id]), @IdMax = MAX([Id]) FROM [#TriggersOnSchemaBoundViews] WHERE [IsEncrypted] = 0;
+        WHILE (@Id <= @IdMax)
+        BEGIN
+            BEGIN
+                
+                SELECT @TriggerId = [TriggerId] FROM [#TriggersOnSchemaBoundViews] WHERE [Id] = @Id
+                SET @SqlTriggerDefinition = CONCAT('SELECT  @_TriggerDefinition = [definition] FROM [', DB_NAME(), '].sys.sql_modules WHERE [object_id] = @_TriggerId;');
+                SET @ParamDefinition = N'@_TriggerId INT, @_TriggerDefinition NVARCHAR(MAX) OUTPUT';
+
+                EXEC sys.sp_executesql @stmt = @SqlTriggerDefinition, @params = @ParamDefinition, @_TriggerId = @TriggerId, @_TriggerDefinition = @TriggerDefinition OUTPUT;
+                                
+                SET @PointerString = 0;
+                SET @PointerNewLine = -2; /* (-2) because at first iteration we want to catch the first 2 characters of the first line */
+    
+                DBCC CHECKIDENT('#TriggerDefinitions', RESEED, 0) WITH NO_INFOMSGS;
+    
+                /* Print out (save into temp table) each line at a time: */
+                WHILE @PointerString <= LEN(@TriggerDefinition)
+                BEGIN
+                    IF (   (SUBSTRING(@TriggerDefinition, @PointerString + 1, 2) = @crlf)
+                     OR    (@PointerString = LEN(@TriggerDefinition))
+                       )
+                    BEGIN
+                        SELECT @LineOfCode = REPLACE(REPLACE(SUBSTRING(@TriggerDefinition, @PointerNewLine + LEN(@crlf), (@PointerString - @PointerNewLine)), CHAR(13), ''), CHAR(10), '');
+                        INSERT INTO [#TriggerDefinitions] ([TriggerId], [LineOfCode]) VALUES (@TriggerId, @LineOfCode);
+                        SET @PointerNewLine = @PointerString;
+                    END;
+                    SET @PointerString = @PointerString + 1;
+                END;
+            END;
+            SELECT @Id = MIN([Id]) FROM [#TriggersOnSchemaBoundViews] WHERE [Id] > @Id AND [IsEncrypted] = 0;
+        END;
+    END;
 END;
 
 PRINT ('/*--------------------------------------- UPDATING [IsCDCEnabled] flag of [#SelectedTables]: ---------------------*/');
@@ -1005,7 +1086,7 @@ PRINT ('/*--------------------------------------- POPULATING [#CDCInstances]: --
 IF (@IsDbCDCEnabled = 1)
 INSERT INTO [#CDCInstances]
     (
-        [ReferencingObjectId]
+        [CdcObjectId]
       , [ReferncedObjectId]
       , [source_schema]
       , [source_name]
@@ -1017,7 +1098,7 @@ INSERT INTO [#CDCInstances]
       , [filegroup_name]
       , [allow_partition_switch]
     )
-SELECT [ct].[object_id] AS [ReferencingObjectId]
+SELECT [ct].[object_id] AS [CdcObjectId]
      , [so].[object_id] AS [ReferncedObjectId]
      , [ss].[name] AS [source_schema]
      , [so].[name] AS [source_name]
@@ -1069,7 +1150,7 @@ UPDATE [st]
 SET [st].[NumCDCInstReferencing] = [cdc].[ReferencingObjCnt]
 FROM [#SelectedTables] AS [st]
 CROSS APPLY (
-                SELECT COUNT([cdc].[ReferencingObjectId]) AS [ReferencingObjCnt]
+                SELECT COUNT([cdc].[CdcObjectId]) AS [ReferencingObjCnt]
                 FROM [#CDCInstances] AS [cdc]
                 WHERE [cdc].[ReferncedObjectId] = [st].[ObjectID]
                 AND   [st].[IsCDCEnabled] = 1
@@ -1390,7 +1471,7 @@ BEGIN
                                  SELECT 1
                                  FROM [#SbvToSelTablesLink] AS [sbvcr]
                                  JOIN [#SchemaBoundViews] AS [sbv]
-                                     ON  [sbvcr].[ReferencingObjectId] = [sbv].[ReferencingObjectId]
+                                     ON  [sbvcr].[SbvObjectId] = [sbv].[SbvObjectId]
                                      AND [sbvcr].[ReferncedObjectId] = [st].[ObjectID]
                                      AND [sbv].[Id] = @Id
                              );            
@@ -1851,7 +1932,7 @@ BEGIN
                 COMMIT TRANSACTION;
                 BEGIN TRANSACTION;
             END;            
-            IF (@@ERROR = 0 AND @ErrorMessage IS NULL) 
+            IF (@ErrorMessage IS NULL) 
             BEGIN
                 SELECT @CountCDCInstReenabled = @CountCDCInstReenabled + 1;
                 
@@ -1946,7 +2027,7 @@ BEGIN
         
         IF (@IsEncrypted = 1 AND @SqlRecreateView IS NULL)
         BEGIN
-            SELECT @ErrorMessage = CONCAT('Definition of Schema-Bound View: ', QUOTENAME(@SchBvName), ' is encrypted, unable to recreate it');
+            SELECT @ErrorMessage = CONCAT('Definition of Schema-Bound View: ', QUOTENAME(@SchBvName), ' is encrypted, unable to recreate this view any indexes/triggers depending on it');
             IF (@WhatIf = 1)
             BEGIN 
                 PRINT(CONCAT('/* !!! Warning: ', @ErrorMessage, ' */'))
@@ -1985,7 +2066,7 @@ BEGIN
                     COMMIT TRANSACTION;
                     BEGIN TRANSACTION;
                 END;            
-                IF (@@ERROR = 0 AND @ErrorMessage IS NULL) 
+                IF (@ErrorMessage IS NULL) 
                 BEGIN
                     SELECT @CountSchBvRecreated = @CountSchBvRecreated + 1;
                     
@@ -1999,7 +2080,7 @@ BEGIN
                                      SELECT 1
                                      FROM [#SbvToSelTablesLink] AS [sbvcr]
                                      JOIN [#SchemaBoundViews] AS [sbv]
-                                         ON  [sbvcr].[ReferencingObjectId] = [sbv].[ReferencingObjectId]
+                                         ON  [sbvcr].[SbvObjectId] = [sbv].[SbvObjectId]
                                          AND [sbvcr].[ReferncedObjectId] = [st].[ObjectID]
                                          AND [sbv].[Id] = @Id
                                  );
@@ -2118,16 +2199,16 @@ BEGIN
     
     IF EXISTS (
                 SELECT 1 FROM [#IndexesOnSchemaBoundViews] AS [isbv]
-                JOIN [#SchemaBoundViews] AS [sbv] ON [sbv].[ReferencingObjectId] = [isbv].[ReferencedViewObjectId]
+                JOIN [#SchemaBoundViews] AS [sbv] ON [sbv].[SbvObjectId] = [isbv].[ReferencedViewObjectId]
                 WHERE [sbv].[Recreated] = 1
               )
     BEGIN
-        PRINT ('/*--------------------------------------- RECREATING INDEXES ON SCHEMA-BOUND VIEWS: -----------------------------------------*/');
+        PRINT ('/*--------------------------------------- RECREATING INDEXES ON SCHEMA-BOUND VIEWS: ------------------------------*/');
 
         SELECT @Id = MIN([isbv].[Id]), @IdMax = MAX([isbv].[Id])
         FROM [#IndexesOnSchemaBoundViews] AS [isbv]
         JOIN [#SchemaBoundViews] AS [sbv]
-            ON [sbv].[ReferencingObjectId] = [isbv].[ReferencedViewObjectId]
+            ON [sbv].[SbvObjectId] = [isbv].[ReferencedViewObjectId]
         WHERE [sbv].[Recreated] = 1;
     
         WHILE (@Id <= @IdMax)
@@ -2191,16 +2272,132 @@ BEGIN
             SELECT @Id = MIN([isbv].[Id])
             FROM [#IndexesOnSchemaBoundViews] AS [isbv]
             JOIN [#SchemaBoundViews] AS [sbv]
-                ON [sbv].[ReferencingObjectId] = [isbv].[ReferencedViewObjectId]
+                ON [sbv].[SbvObjectId] = [isbv].[ReferencedViewObjectId]
             WHERE [sbv].[Recreated] = 1 AND [isbv].[Id] > @Id;
         END
     END
-END;
 
+    IF EXISTS (
+                SELECT 1 FROM [#TriggersOnSchemaBoundViews] AS [tsbv]
+                JOIN [#SchemaBoundViews] AS [sbv] ON [sbv].[SbvObjectId] = [tsbv].[ReferencedViewObjectId]
+                WHERE [sbv].[Recreated] = 1
+              )
+    BEGIN
+        PRINT ('/* -------------------------------------- RECREATING TRIGGERS ON SCHEMA-BOUND VIEWS: -----------------------------*/');
+
+        SELECT @Id = MIN([tsbv].[Id]), @IdMax = MAX([tsbv].[Id]) 
+        FROM [#TriggersOnSchemaBoundViews] AS [tsbv]
+        JOIN [#SchemaBoundViews] AS [sbv] 
+            ON [sbv].[SbvObjectId] = [tsbv].[ReferencedViewObjectId]
+        WHERE [sbv].[Recreated] = 1
+
+        WHILE (@Id <= @IdMax)
+        BEGIN
+            BEGIN
+                
+                SELECT 
+                       @TriggerName = [TriggerName]
+                     , @IsEncrypted = [IsEncrypted]
+                     , @TriggerId = [TriggerId]
+                FROM [#TriggersOnSchemaBoundViews] 
+                WHERE [Id] = @Id
+
+                IF (@IsEncrypted = 1)
+                BEGIN
+                    SELECT @ErrorMessage = CONCAT('Definition of Trigger: ', @TriggerName, ' is encrypted, unable to recreate it');
+                    IF (@WhatIf = 1)
+                    BEGIN 
+                        PRINT(CONCAT('/* !!! Warning: ', @ErrorMessage, ' */'))
+                    END
+                    ELSE 
+                    BEGIN
+                        IF (@ContinueOnError <> 1) GOTO ERROR
+                        ELSE 
+                        BEGIN
+                                RAISERROR(@ErrorMessage, @ErrorSeverity11, 1) WITH NOWAIT;  
+                                SET @ParamDefinition = '@_ErrorMessage NVARCHAR(4000), @_Id INT';
+                                SET @SqlLogError = 'UPDATE [#TriggersOnSchemaBoundViews] SET [ErrorMessage] = CONCAT([ErrorMessage]+''; '', @_ErrorMessage) WHERE [Id] = @_Id';
+                                EXEC sys.sp_executesql @stmt = @SqlLogError, @params = @ParamDefinition, @_ErrorMessage = @ErrorMessage, @_Id = @Id;
+                        END            
+                    END 
+                END
+                ELSE 
+                BEGIN               
+                    SELECT @LineOfCodeId = MIN([LineId]), @LineOfCodeIdMax = MAX([LineId]) 
+                    FROM [#TriggerDefinitions]
+                    WHERE [TriggerId] = @TriggerId       
+
+                    WHILE (@LineOfCodeId <= @LineOfCodeIdMax)
+                    BEGIN                                              
+                        SELECT @SqlRecreateTrgOnSchBv = CONCAT(@SqlRecreateTrgOnSchBv, TRIM([LineOfCode]), @crlf) 
+                        FROM [#TriggerDefinitions] 
+                        WHERE [TriggerId] = @TriggerId AND [LineId] = @LineOfCodeId
+
+                        SELECT @LineOfCodeId = MIN([LineId]) FROM [#TriggerDefinitions]
+                        WHERE [TriggerId] = @TriggerId AND [LineId] > @LineOfCodeId
+                    END
+                END
+            END;
+            
+            IF (@WhatIf = 0)
+            BEGIN TRY            
+                IF (@ContinueOnError = 1 AND XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
+                BEGIN
+                    COMMIT TRANSACTION;
+                    BEGIN TRANSACTION;
+                END;            
+                EXEC sys.sp_executesql @stmt = @SqlRecreateTrgOnSchBv;
+                IF (@ContinueOnError = 1 AND XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
+                BEGIN
+                    COMMIT TRANSACTION;
+                    BEGIN TRANSACTION;
+                END;
+                PRINT (CONCAT('Successfully recreated trigger: ', @TriggerName));
+            END TRY
+            BEGIN CATCH
+                  SET @ErrorMessage = CONCAT('Error: ', ERROR_MESSAGE(), ' Failed executing: ', @SqlRecreateTrgOnSchBv);
+                  IF (@ContinueOnError <> 1)
+                      GOTO ERROR;
+                  ELSE /* continue execution but log the error: */
+                  BEGIN
+                    RAISERROR(@ErrorMessage, @ErrorSeverity11, 1) WITH NOWAIT;                
+                    IF (XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
+                    BEGIN
+                        ROLLBACK TRANSACTION;
+                        BEGIN TRANSACTION;
+                    END;
+                    
+                    SET @ParamDefinition = '@_ErrorMessage NVARCHAR(4000), @_Id INT';
+                    SET @SqlLogError = 'UPDATE [#TriggersOnSchemaBoundViews] SET [ErrorMessage] = CONCAT([ErrorMessage]+''; '', @_ErrorMessage) WHERE [Id] = @_Id;';
+                    EXEC sys.sp_executesql @stmt = @SqlLogError, @params = @ParamDefinition, @_ErrorMessage = @ErrorMessage, @_Id = @Id;
+                    
+                    IF (XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
+                    BEGIN
+                        COMMIT TRANSACTION;
+                        BEGIN TRANSACTION;
+                    END;
+                    SET @ErrorMessage = NULL;
+                  END;
+            END CATCH
+            ELSE IF (@WhatIf = 1)
+            BEGIN
+                PRINT(@SqlRecreateTrgOnSchBv);
+            END 
+
+            SET @SqlRecreateTrgOnSchBv = NULL
+
+            SELECT @Id = MIN([tsbv].[Id])
+            FROM [#TriggersOnSchemaBoundViews] AS [tsbv]
+            JOIN [#SchemaBoundViews] AS [sbv] 
+                ON [sbv].[SbvObjectId] = [tsbv].[ReferencedViewObjectId]
+            WHERE [sbv].[Recreated] = 1 AND [tsbv].[Id] > @Id;
+        END;
+    END
+END;
 
 IF (@CountFKFound > 0)
 BEGIN
-    PRINT ('/*--------------------------------------- RECREATING FK CONSTRAINTS: ---------------------------------------------*/');
+    PRINT ('/* -------------------------------------- RECREATING FK CONSTRAINTS: ---------------------------------------------*/');
     SELECT @Id = MIN([Id]), @IdMax = MAX([Id]) FROM [#ForeignKeyConstraintDefinitions];
     WHILE (@Id <= @IdMax)
     BEGIN
@@ -2226,7 +2423,7 @@ BEGIN
                 COMMIT TRANSACTION;
                 BEGIN TRANSACTION;
             END;            
-            IF (@@ERROR = 0 AND @ErrorMessage IS NULL) 
+            IF (@ErrorMessage IS NULL) 
             BEGIN
                 SELECT @CountFKRecreated = @CountFKRecreated + 1;
                 
