@@ -1,6 +1,12 @@
 USE [master]
 GO
 
+IF (CAST(SUBSTRING(CAST(SERVERPROPERTY('ProductVersion') AS VARCHAR(20)), 1, 2) AS INT) < 14)
+BEGIN
+    RAISERROR('Sorry, on SQL Versions older than 14 (2017) you can only install/run this sp if you modify the code in all sections where @DbEngineVersion is used', 18, 1)
+END
+GO
+
 IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.ROUTINES WHERE ROUTINE_NAME = 'sp_ForceTruncate')
     EXEC ('CREATE PROC dbo.sp_ForceTruncate AS SELECT ''stub version, to be replaced''')
 GO
@@ -23,16 +29,17 @@ ALTER PROCEDURE [dbo].[sp_ForceTruncate]
 /* ==================================================================================================================== */
 /* Change History:                                                                                                      */
 /* -------------------------------------------------------------------------------------------------------------------- */
-/* Date:       User:           Version:  Change:                                                                        */
+/* Date:       Version:  Change:                                                                                        */
 /* -------------------------------------------------------------------------------------------------------------------- */
-/* 2024-11-21  CleanSql.com    1.00      Created                                                                        */
-/* 2024-12-06  CleanSql.com    1.01      added @SchemaName/@TableName validation                                        */
-/*                                       allowed new-lines in input params: @SchemaNames/@TableNames if present         */
-/*                                       using sys.tables for @TruncateAllTablesPerDB instead of INFORMATION_SCHEMA     */
-/* 2024-12-12  CleanSql.com    1.02      improved @TableNames validation and error handling,                            */
-/*                                       added support for [#IndexesOnSchemaBoundViews], encrypted SchBv error-handling */
-/*                                       and for [#TriggerssOnSchemaBoundViews] + encrypted Trgr error-handling         */
-/* 2024-12-12  CleanSql.com    1.03      fixed bug: missing schema in ON clause populating [#IndexesOnSchemaBoundViews] */
+/* 2024-11-21  1.00      Created                                                                                        */
+/* 2024-12-06  1.01      added @SchemaName/@TableName validation                                                        */
+/*                       allowed new-lines in input params: @SchemaNames/@TableNames if present                         */
+/*                       using sys.tables for @TruncateAllTablesPerDB instead of INFORMATION_SCHEMA                     */
+/* 2024-12-12  1.02      improved @TableNames validation and error handling,                                            */
+/*                       added support for [#IndexesOnSchemaBoundViews], encrypted SchBv error-handling                 */
+/*                       and for [#TriggerssOnSchemaBoundViews] + encrypted Trgr error-handling                         */
+/* 2024-12-12  1.03      fixed bug: missing schema in ON clause populating [#IndexesOnSchemaBoundViews]                 */
+/* 2024-12-14  1.04      resetting @ErrorMessage = NULL after error logging in recreate section                         */
 /* -------------------------------------------------------------------------------------------------------------------- */
 /* ==================================================================================================================== */
 /* Example use:
@@ -87,13 +94,15 @@ DECLARE
 /* ==================================================================================================================== */
 
   /* Internal parameters: */
-    @SpCurrentVersion                CHAR(5) = '1.03'
+    @SpCurrentVersion                CHAR(5) = '1.04'
   , @ObjectId                        BIGINT
   , @SchemaId                        INT
   , @StartSearchSch                  INT
   , @DelimiterPosSch                 INT
   , @SchemaName                      SYSNAME
   , @TableName                       SYSNAME
+  , @TemporalType                    TINYINT
+  , @HistoryTblName                  SYSNAME
   , @SchBvName                       SYSNAME
   , @StartSearchTbl                  INT
   , @DelimiterPosTbl                 INT
@@ -166,6 +175,7 @@ DECLARE
   , @CountTblsReferencedBySchBvs     INT           = 0
   , @CountFKObjectIdTrgt             INT           = 0
   , @CountTblsReferencedByArticles   INT           = 0
+  , @CountTemporalTbls               INT           = 0
   
   , @level0type                      VARCHAR(128)
   , @level0name                      SYSNAME
@@ -190,6 +200,14 @@ PRINT(CONCAT('/* Current SP Version: ', @SpCurrentVersion, ' */'))
 /* ==================================================================================================================== */
 /* ----------------------------------------- VALIDATE INPUT PARAMETERS: ----------------------------------------------- */
 /* ==================================================================================================================== */
+
+SELECT @DbEngineVersion = CAST(SUBSTRING(CAST(SERVERPROPERTY('ProductVersion') AS VARCHAR(20)), 1, 2) AS INT);
+IF (@DbEngineVersion < 14)
+BEGIN
+    SET @ErrorMessage = 'Sorry, on SQL Versions older than 14 (2017) you can only install/run this sp if you modify the code in all sections where @DbEngineVersion is used'
+    GOTO ERROR
+END
+
 IF @TruncateAllTablesPerDB = 0 AND (LEN(@SchemaNames) = 0 OR LEN(@TableNames) = 0)
 BEGIN
     SET @ErrorMessage = N'@SchemaNames AND @TableNames parameters can not be empty, unless you want to truncate ALL tables per DB by using @TruncateAllTablesPerDB = 1';
@@ -219,6 +237,8 @@ CREATE TABLE [#SelectedTables]
   , [IsReferencedBySchBv]   BIT           NULL
   , [IsCDCEnabled]          BIT           NULL
   , [IsPublished]           BIT           NULL
+  , [TemporalType]          TINYINT       NULL
+  , [HistoryTblObjectID]    INT           NULL UNIQUE
 
   , [NumFkReferencing]      INT           NULL
   , [NumFkDropped]          INT           NULL
@@ -510,8 +530,6 @@ BEGIN
     END;
 END;
 
-SELECT @DbEngineVersion = CAST(SUBSTRING(CAST(SERVERPROPERTY('ProductVersion') AS VARCHAR(20)), 1, 2) AS INT);
-
 PRINT ('/*--------------------------------------- UPDATING [RowCountBefore] AND [IsToBeTruncated] OF [#SelectedTables] ---*/');
 TRUNCATE TABLE [#TableRowCounts];
 SELECT @Id = MIN([Id]), @IdMax = MAX([Id]) FROM [#SelectedTables];
@@ -533,7 +551,7 @@ BEGIN
                           , LEN(@UnionAll)
                           , ''
                          )
-          ELSE /* For SQL Versions 14+ (2017+) use STRING_AGG(): */
+          ELSE /* For SQL Versions 14+ (2017+) use STRING_AGG() - comment below section out if you want to install on older versions */
                    STRING_AGG(
                                  CONCAT(
                                            'SELECT '
@@ -1174,6 +1192,27 @@ WHERE [tb].[is_published] = 1
 OR    [tb].[is_merge_published] = 1
 OR    [tb].[is_schema_published] = 1;
 
+
+IF (@DbEngineVersion >= 13)
+BEGIN
+    PRINT ('/*--------------------------------------- UPDATING [TemporalType] value of [#SelectedTables]: ----------------*/');
+    
+    UPDATE [st]
+    SET [st].[TemporalType] = [tb].[temporal_type]
+      , [st].[HistoryTblObjectID] = [ht].[object_id]
+    FROM [#SelectedTables] AS [st]
+    JOIN sys.tables AS [tb]
+        ON [st].[ObjectID] = [tb].[object_id]
+        AND [st].[IsToBeTruncated] = 1
+    LEFT JOIN sys.tables [ht] 
+        ON [tb].[history_table_id] = [ht].[object_id]
+    WHERE [tb].[temporal_type] > 0
+    
+    SELECT @CountTemporalTbls = @@ROWCOUNT;
+
+    PRINT (CONCAT(N'/* Updated: ', @CountTemporalTbls, ' Tables as Temporal in: [', DB_NAME(DB_ID()), N'] database */'));
+END
+
 PRINT ('/*--------------------------------------- POPULATING [#PublicationsArticles]: -------------------------------------*/');
 SELECT @CountPublishedTablesFound = COUNT([Id]) FROM [#SelectedTables] WHERE [IsPublished] = 1 AND [IsToBeTruncated] = 1;
 PRINT (CONCAT(N'/* Flagged: ', @CountPublishedTablesFound, ' Tables as Published within the set of: ', @CountTablesSelected, ' tables selected for truncation in : [', DB_NAME(), N'] db */'));
@@ -1675,8 +1714,23 @@ BEGIN
 
         SELECT @SchemaName = [SchemaName]
              , @TableName = [TableName]
+             , @TemporalType = [TemporalType]
         FROM [#SelectedTables]
         WHERE [IsToBeTruncated] = 1 AND [Id] = @Id;
+
+        --SELECT * FROM [#SelectedTables]
+
+        IF (@TemporalType = 1)
+        BEGIN
+            SET @ErrorMessage = CONCAT('Temporal Table name: ', QUOTENAME(@SchemaName), '.', QUOTENAME(@TableName)
+                                    , ' is of type 1 HISTORY_TABLE and can not be truncated, remove it from the list of @TableNames')
+            GOTO ERROR
+        END        
+
+        IF (@TemporalType = 2)
+        BEGIN
+            PRINT(CONCAT('Temporal Table name: ', QUOTENAME(@SchemaName), '.', QUOTENAME(@TableName), '; '))
+        END
         
         SELECT @SqlTruncateTable = CONCAT('TRUNCATE TABLE ', QUOTENAME(@SchemaName), '.', QUOTENAME(@TableName), '; ')
              , @SqlSetIsTruncated = CONCAT('IF EXISTS (SELECT 1 FROM [', [SchemaName], '].[', [TableName], ']) SET @_IsTruncated = 0 ELSE SET @_IsTruncated = 1;')
@@ -1850,6 +1904,7 @@ BEGIN
                 SET @ParamDefinition = '@_ErrorMessage NVARCHAR(4000), @_Id INT';
                 SET @SqlLogError = 'UPDATE [#PublicationsArticles] SET [ErrorMessage] = CONCAT([ErrorMessage]+''; '', @_ErrorMessage) WHERE [Id] = @_Id';
                 EXEC sys.sp_executesql @stmt = @SqlLogError, @params = @ParamDefinition, @_ErrorMessage = @ErrorMessage, @_Id = @Id;
+                SET @ErrorMessage = NULL
                 
                 IF (XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
                 BEGIN
@@ -1881,6 +1936,7 @@ BEGIN
           SET @ParamDefinition = '@_ErrorMessage NVARCHAR(4000), @_Id INT';        
           SET @SqlLogError = 'UPDATE [#PublicationsArticles] SET [ErrorMessage] = CONCAT([ErrorMessage]+''; '', @_ErrorMessage);';        
           EXEC sys.sp_executesql @stmt = @SqlLogError, @params = @ParamDefinition, @_ErrorMessage = @ErrorMessage, @_Id = @Id;
+          SET @ErrorMessage = NULL
           
           IF (XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
           BEGIN
@@ -1968,6 +2024,7 @@ BEGIN
                 SET @ParamDefinition = '@_ErrorMessage NVARCHAR(4000), @_Id INT';
                 SET @SqlLogError = 'UPDATE [#CDCInstances] SET [ErrorMessage] = CONCAT([ErrorMessage]+''; '', @_ErrorMessage) WHERE [Id] = @_Id';
                 EXEC sys.sp_executesql @stmt = @SqlLogError, @params = @ParamDefinition, @_ErrorMessage = @ErrorMessage, @_Id = @Id;
+                SET @ErrorMessage = NULL
                 
                 IF (XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
                 BEGIN
@@ -1999,6 +2056,7 @@ BEGIN
           SET @ParamDefinition = '@_ErrorMessage NVARCHAR(4000), @_Id INT';        
           SET @SqlLogError = 'UPDATE [#CDCInstances] SET [ErrorMessage] = CONCAT([ErrorMessage]+''; '', @_ErrorMessage);';        
           EXEC sys.sp_executesql @stmt = @SqlLogError, @params = @ParamDefinition, @_ErrorMessage = @ErrorMessage, @_Id = @Id;
+          SET @ErrorMessage = NULL
           
           IF (XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
           BEGIN
@@ -2045,6 +2103,7 @@ BEGIN
                         SET @ParamDefinition = '@_ErrorMessage NVARCHAR(4000), @_Id INT';
                         SET @SqlLogError = 'UPDATE [#SchemaBoundViews] SET [ErrorMessage] = CONCAT([ErrorMessage]+''; '', @_ErrorMessage) WHERE [Id] = @_Id';
                         EXEC sys.sp_executesql @stmt = @SqlLogError, @params = @ParamDefinition, @_ErrorMessage = @ErrorMessage, @_Id = @Id;
+                        SET @ErrorMessage = NULL
                 END            
             END 
         END
@@ -2106,6 +2165,7 @@ BEGIN
                     SET @ParamDefinition = '@_ErrorMessage NVARCHAR(4000), @_Id INT';
                     SET @SqlLogError = 'UPDATE [#SchemaBoundViews] SET [ErrorMessage] = CONCAT([ErrorMessage]+''; '', @_ErrorMessage) WHERE [Id] = @_Id';
                     EXEC sys.sp_executesql @stmt = @SqlLogError, @params = @ParamDefinition, @_ErrorMessage = @ErrorMessage, @_Id = @Id;
+                    SET @ErrorMessage = NULL
                     
                     IF (XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
                     BEGIN
@@ -2154,6 +2214,7 @@ BEGIN
                     SET @ParamDefinition = '@_ErrorMessage NVARCHAR(4000), @_Id INT';
                     SET @SqlLogError = 'UPDATE [#SchemaBoundViews] SET [ErrorMessage] = CONCAT([ErrorMessage]+''; '', @_ErrorMessage) WHERE [Id] = @_Id';
                     EXEC sys.sp_executesql @stmt = @SqlLogError, @params = @ParamDefinition, @_ErrorMessage = @ErrorMessage, @_Id = @Id;
+                    SET @ErrorMessage = NULL
                     
                     IF (XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
                     BEGIN
@@ -2185,6 +2246,7 @@ BEGIN
           SET @ParamDefinition = '@_ErrorMessage NVARCHAR(4000), @_Id INT';        
           SET @SqlLogError = 'UPDATE [#SchemaBoundViews] SET [ErrorMessage] = CONCAT([ErrorMessage]+''; '', @_ErrorMessage);';        
           EXEC sys.sp_executesql @stmt = @SqlLogError, @params = @ParamDefinition, @_ErrorMessage = @ErrorMessage, @_Id = @Id;
+          SET @ErrorMessage = NULL
           
           IF (XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
           BEGIN
@@ -2263,6 +2325,7 @@ BEGIN
                     SET @ParamDefinition = '@_ErrorMessage NVARCHAR(4000), @_Id INT';
                     SET @SqlLogError = 'UPDATE [#IndexesOnSchemaBoundViews] SET [ErrorMessage] = CONCAT([ErrorMessage]+''; '', @_ErrorMessage) WHERE [Id] = @_Id';
                     EXEC sys.sp_executesql @stmt = @SqlLogError, @params = @ParamDefinition, @_ErrorMessage = @ErrorMessage, @_Id = @Id;
+                    SET @ErrorMessage = NULL
                     
                     IF (XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
                     BEGIN
@@ -2297,8 +2360,7 @@ BEGIN
 
         WHILE (@Id <= @IdMax)
         BEGIN
-            BEGIN
-                
+            BEGIN                
                 SELECT 
                        @TriggerName = [TriggerName]
                      , @IsEncrypted = [IsEncrypted]
@@ -2322,10 +2384,12 @@ BEGIN
                                 SET @ParamDefinition = '@_ErrorMessage NVARCHAR(4000), @_Id INT';
                                 SET @SqlLogError = 'UPDATE [#TriggersOnSchemaBoundViews] SET [ErrorMessage] = CONCAT([ErrorMessage]+''; '', @_ErrorMessage) WHERE [Id] = @_Id';
                                 EXEC sys.sp_executesql @stmt = @SqlLogError, @params = @ParamDefinition, @_ErrorMessage = @ErrorMessage, @_Id = @Id;
+                                SET @ErrorMessage = NULL
                         END            
                     END 
                 END
-                ELSE 
+                
+                IF (@IsEncrypted = 0)
                 BEGIN               
                     SELECT @LineOfCodeId = MIN([LineId]), @LineOfCodeIdMax = MAX([LineId]) 
                     FROM [#TriggerDefinitions]
@@ -2340,53 +2404,54 @@ BEGIN
                         SELECT @LineOfCodeId = MIN([LineId]) FROM [#TriggerDefinitions]
                         WHERE [TriggerId] = @TriggerId AND [LineId] > @LineOfCodeId
                     END
+
+                    IF (@WhatIf = 0)
+                    BEGIN TRY            
+                        IF (@ContinueOnError = 1 AND XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
+                        BEGIN
+                            COMMIT TRANSACTION;
+                            BEGIN TRANSACTION;
+                        END;            
+                        EXEC sys.sp_executesql @stmt = @SqlRecreateTrgOnSchBv;
+                        IF (@ContinueOnError = 1 AND XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
+                        BEGIN
+                            COMMIT TRANSACTION;
+                            BEGIN TRANSACTION;
+                        END;
+                        PRINT (CONCAT('Successfully recreated trigger: ', @TriggerName));
+                    END TRY
+                    BEGIN CATCH
+                          SET @ErrorMessage = CONCAT('Error: ', ERROR_MESSAGE(), ' Failed executing: ', @SqlRecreateTrgOnSchBv);
+                          IF (@ContinueOnError <> 1)
+                              GOTO ERROR;
+                          ELSE /* continue execution but log the error: */
+                          BEGIN
+                            RAISERROR(@ErrorMessage, @ErrorSeverity11, 1) WITH NOWAIT;
+                            
+                            IF (XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
+                            BEGIN
+                                ROLLBACK TRANSACTION;
+                                BEGIN TRANSACTION;
+                            END;
+                            
+                            SET @ParamDefinition = '@_ErrorMessage NVARCHAR(4000), @_Id INT';
+                            SET @SqlLogError = 'UPDATE [#TriggersOnSchemaBoundViews] SET [ErrorMessage] = CONCAT([ErrorMessage]+''; '', @_ErrorMessage) WHERE [Id] = @_Id;';
+                            EXEC sys.sp_executesql @stmt = @SqlLogError, @params = @ParamDefinition, @_ErrorMessage = @ErrorMessage, @_Id = @Id;
+                            SET @ErrorMessage = NULL
+
+                            IF (XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
+                            BEGIN
+                                COMMIT TRANSACTION;
+                                BEGIN TRANSACTION;
+                            END;
+                          END;
+                    END CATCH
+                    ELSE IF (@WhatIf = 1)
+                    BEGIN
+                        PRINT(CONCAT(@SqlRecreateTrgOnSchBv, 'GO'));
+                    END
                 END
-            END;
-            
-            IF (@WhatIf = 0)
-            BEGIN TRY            
-                IF (@ContinueOnError = 1 AND XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
-                BEGIN
-                    COMMIT TRANSACTION;
-                    BEGIN TRANSACTION;
-                END;            
-                EXEC sys.sp_executesql @stmt = @SqlRecreateTrgOnSchBv;
-                IF (@ContinueOnError = 1 AND XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
-                BEGIN
-                    COMMIT TRANSACTION;
-                    BEGIN TRANSACTION;
-                END;
-                PRINT (CONCAT('Successfully recreated trigger: ', @TriggerName));
-            END TRY
-            BEGIN CATCH
-                  SET @ErrorMessage = CONCAT('Error: ', ERROR_MESSAGE(), ' Failed executing: ', @SqlRecreateTrgOnSchBv);
-                  IF (@ContinueOnError <> 1)
-                      GOTO ERROR;
-                  ELSE /* continue execution but log the error: */
-                  BEGIN
-                    RAISERROR(@ErrorMessage, @ErrorSeverity11, 1) WITH NOWAIT;                
-                    IF (XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
-                    BEGIN
-                        ROLLBACK TRANSACTION;
-                        BEGIN TRANSACTION;
-                    END;
-                    
-                    SET @ParamDefinition = '@_ErrorMessage NVARCHAR(4000), @_Id INT';
-                    SET @SqlLogError = 'UPDATE [#TriggersOnSchemaBoundViews] SET [ErrorMessage] = CONCAT([ErrorMessage]+''; '', @_ErrorMessage) WHERE [Id] = @_Id;';
-                    EXEC sys.sp_executesql @stmt = @SqlLogError, @params = @ParamDefinition, @_ErrorMessage = @ErrorMessage, @_Id = @Id;
-                    
-                    IF (XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
-                    BEGIN
-                        COMMIT TRANSACTION;
-                        BEGIN TRANSACTION;
-                    END;
-                    SET @ErrorMessage = NULL;
-                  END;
-            END CATCH
-            ELSE IF (@WhatIf = 1)
-            BEGIN
-                PRINT(CONCAT(@SqlRecreateTrgOnSchBv, 'GO'));
-            END 
+            END;            
 
             SET @SqlRecreateTrgOnSchBv = NULL
 
@@ -2454,6 +2519,7 @@ BEGIN
                 SET @ParamDefinition = '@_ErrorMessage NVARCHAR(4000), @_Id INT';
                 SET @SqlLogError = 'UPDATE [#ForeignKeyConstraintDefinitions] SET [ErrorMessage] = CONCAT([ErrorMessage]+''; '', @_ErrorMessage) WHERE [Id] = @_Id';
                 EXEC sys.sp_executesql @stmt = @SqlLogError, @params = @ParamDefinition, @_ErrorMessage = @ErrorMessage, @_Id = @Id;
+                SET @ErrorMessage = NULL
                 
                 IF (XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
                 BEGIN
@@ -2484,6 +2550,7 @@ BEGIN
           SET @ParamDefinition = '@_ErrorMessage NVARCHAR(4000), @_Id INT';        
           SET @SqlLogError = 'UPDATE [#ForeignKeyConstraintDefinitions] SET [ErrorMessage] = CONCAT([ErrorMessage]+''; '', @_ErrorMessage);';        
           EXEC sys.sp_executesql @stmt = @SqlLogError, @params = @ParamDefinition, @_ErrorMessage = @ErrorMessage, @_Id = @Id;
+          SET @ErrorMessage = NULL
           
           IF (XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
           BEGIN
@@ -2584,6 +2651,7 @@ BEGIN
                 SET @ParamDefinition = '@_ErrorMessage NVARCHAR(4000), @_Id INT';
                 SET @SqlLogError = 'UPDATE [#SelectedTables] SET [ErrorMessage] = CONCAT([ErrorMessage]+''; '', @_ErrorMessage) WHERE [Id] = @_Id';
                 EXEC sys.sp_executesql @stmt = @SqlLogError, @params = @ParamDefinition, @_ErrorMessage = @ErrorMessage, @_Id = @Id;
+                SET @ErrorMessage = NULL
                 
                 IF (XACT_STATE() <> 0 AND @@TRANCOUNT > 0)
                 BEGIN
@@ -2653,6 +2721,8 @@ BEGIN
          SELECT '[#PublicationsArticles]' AS [TableName] FROM [#PublicationsArticles] WHERE [ErrorMessage] IS NOT NULL
          UNION
          SELECT '[#CDCInstances]' AS [TableName] FROM [#CDCInstances] WHERE [ErrorMessage] IS NOT NULL
+         UNION 
+         SELECT '[#TriggersOnSchemaBoundViews]' AS [TableName] FROM [#TriggersOnSchemaBoundViews] WHERE [ErrorMessage] IS NOT NULL         
         )
     SELECT @ErrorMessage
         = CASE
@@ -2674,44 +2744,45 @@ BEGIN
         UNION
         SELECT [Id], [article] AS [ObjectName], [ErrorMessage] FROM [#PublicationsArticles] WHERE [ErrorMessage] IS NOT NULL
         UNION
-        SELECT [Id], [capture_instance] AS [ObjectName], [ErrorMessage] FROM [#CDCInstances] WHERE [ErrorMessage] IS NOT NULL    
+        SELECT [Id], [capture_instance] AS [ObjectName], [ErrorMessage] FROM [#CDCInstances] WHERE [ErrorMessage] IS NOT NULL
+        UNION 
+        SELECT [Id], [TriggerName] AS [TableName], [ErrorMessage] FROM [#TriggersOnSchemaBoundViews] WHERE [ErrorMessage] IS NOT NULL         
     END
-    ELSE
+    
+    IF (@ErrorMessage IS NULL AND @WhatIf <> 1)
     BEGIN
-        IF (@WhatIf <> 1)
-        BEGIN
-            PRINT ('/* Script completed successfully. */');
-            SELECT [Id]
-                 , [SchemaID]
-                 , [ObjectID]
-                 , [SchemaName]
-                 , [TableName]
-                 , [IsToBeTruncated]
-                 , [IsTruncated]
-                 , [RowCountBefore]
-                 , [RowCountAfter]
-                 , [ErrorMessage]
-                 , [IsReferencedByFk]
-                 , [IsReferencedBySchBv]
-                 , [IsCDCEnabled]
-                 , [IsPublished]
-                 , [NumFkReferencing]
-                 , [NumFkDropped]
-                 , [NumFkRecreated]
-                 , [NumSchBvReferencing]
-                 , [NumSchBvDropped]
-                 , [NumSchBvRecreated]
-                 , [NumCDCInstReferencing]
-                 , [NumCDCInstDisabled]
-                 , [NumCDCInstReenabled]
-                 , [NumPublArtReferencing]
-                 , [NumPublArtDropped]
-                 , [NumPublArtRecreated]
-            FROM [#SelectedTables]
-            ORDER BY [RowCountBefore] DESC
-                   , [TableName];
-        END;
+        PRINT ('/* Script completed successfully. */');                        
     END;
+
+    SELECT [Id]
+         , [SchemaID]
+         , [ObjectID]
+         , [SchemaName]
+         , [TableName]
+         , [IsToBeTruncated]
+         , [IsTruncated]
+         , [RowCountBefore]
+         , [RowCountAfter]
+         , [ErrorMessage]
+         , [IsReferencedByFk]
+         , [IsReferencedBySchBv]
+         , [IsCDCEnabled]
+         , [IsPublished]
+         , [NumFkReferencing]
+         , [NumFkDropped]
+         , [NumFkRecreated]
+         , [NumSchBvReferencing]
+         , [NumSchBvDropped]
+         , [NumSchBvRecreated]
+         , [NumCDCInstReferencing]
+         , [NumCDCInstDisabled]
+         , [NumCDCInstReenabled]
+         , [NumPublArtReferencing]
+         , [NumPublArtDropped]
+         , [NumPublArtRecreated]
+    FROM [#SelectedTables]
+    ORDER BY [RowCountBefore] DESC
+           , [TableName];
 END;
 FINISH:
 END;
