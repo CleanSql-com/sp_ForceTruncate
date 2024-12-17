@@ -3,7 +3,7 @@ GO
 
 IF (CAST(SUBSTRING(CAST(SERVERPROPERTY('ProductVersion') AS VARCHAR(20)), 1, 2) AS INT) < 14)
 BEGIN
-    RAISERROR('Sorry, on SQL Versions older than 14 (2017) you can only install/run this sp if you modify the code in all sections where @DbEngineVersion is used', 18, 1)
+    RAISERROR('You can only install/run this sp on SQL Versions older than 14 (2017) if you modify the code in all sections where @DbEngineVersion is used', 18, 1)
 END
 GO
 
@@ -40,13 +40,13 @@ ALTER PROCEDURE [dbo].[sp_ForceTruncate]
 /*                       and for [#TriggerssOnSchemaBoundViews] + encrypted Trgr error-handling                         */
 /* 2024-12-12  1.03      fixed bug: missing schema in ON clause populating [#IndexesOnSchemaBoundViews]                 */
 /* 2024-12-14  1.04      resetting @ErrorMessage = NULL after error logging in recreate section                         */
+/* 2024-12-17  1.05      added exception lists (@SchemaNamesExpt/@TableNamesExpt) for @SchemaNames/@TableNames          */
 /* -------------------------------------------------------------------------------------------------------------------- */
 /* ==================================================================================================================== */
 /* Example use:
-                                                                                                                     
+
 USE [AdventureWorks2019];
 GO
-
 DECLARE @SchemaNames         NVARCHAR(MAX) = N'Sales
                                               ,Production'           
       , @TableNames          NVARCHAR(MAX) = N'SalesOrderDetail
@@ -56,6 +56,26 @@ DECLARE @SchemaNames         NVARCHAR(MAX) = N'Sales
 
 EXEC [dbo].[sp_ForceTruncate] @SchemaNames = @SchemaNames
                             , @TableNames = @TableNames
+
+                                                                                                                     
+Truncating all tables over 10 records EXCEPT FOR all tables in HumanResources schema:
+EXEC [dbo].[sp_ForceTruncate] 
+                                     @TruncateAllTablesPerDB = 1
+                                   , @SchemaNamesExpt = 'HumanResources'
+                                   , @TableNamesExpt = '*'
+                                   , @RowCountThreshold = 10
+                                   , @WhatIf = 1
+                                  
+Truncating all tables over 1000 records EXCEPT FOR all tables with 'Dim' in the table name:
+USE [AdventureWorksDW2019]
+GO
+
+EXEC [dbo].[sp_ForceTruncate] 
+                                     @TruncateAllTablesPerDB = 1
+                                   , @SchemaNamesExpt = '*'
+                                   , @TableNamesExpt = 'Dim'
+                                   , @RowCountThreshold = 1000
+                                   , @WhatIf = 1
 */
 /*THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO    */
 /*THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE      */
@@ -78,6 +98,10 @@ EXEC [dbo].[sp_ForceTruncate] @SchemaNames = @SchemaNames
   , @RowCountThreshold               BIGINT        = 0      /* Truncate only tables with rowcount >= @RowCountThreshold  
                                                                this parameter works independently of @TruncateAllTablesPerDB
                                                             */
+  , @SchemaNamesExpt                 NVARCHAR(MAX) = NULL
+  , @TableNamesExpt                  NVARCHAR(MAX) = NULL
+  , @ExceptionListWildcard           CHAR(1)       = '*'
+  
   , @BatchSize                       INT           = 10
   , @ReenableCDC                     BIT           = 1
   , @RecreatePublishedArticles       BIT           = 1
@@ -94,7 +118,7 @@ DECLARE
 /* ==================================================================================================================== */
 
   /* Internal parameters: */
-    @SpCurrentVersion                CHAR(5) = '1.04'
+    @SpCurrentVersion                CHAR(5) = '1.05'
   , @ObjectId                        BIGINT
   , @SchemaId                        INT
   , @StartSearchSch                  INT
@@ -175,6 +199,7 @@ DECLARE
   , @CountTblsReferencedBySchBvs     INT           = 0
   , @CountFKObjectIdTrgt             INT           = 0
   , @CountTblsReferencedByArticles   INT           = 0
+  , @CountExceptionList              INT           = 0
   , @CountTemporalTbls               INT           = 0
   
   , @level0type                      VARCHAR(128)
@@ -195,7 +220,7 @@ DECLARE
   , @publication                     SYSNAME      
   , @article                         SYSNAME;      
 
-PRINT(CONCAT('/* Current SP Version: ', @SpCurrentVersion, ' */'))
+PRINT(CONCAT('/* Current SP Version: ', @SpCurrentVersion, IIF(@WhatIf = 1, 'with @WhatIf = 1 - no actual changes will be made', ''), ' */'))
 
 /* ==================================================================================================================== */
 /* ----------------------------------------- VALIDATE INPUT PARAMETERS: ----------------------------------------------- */
@@ -204,7 +229,7 @@ PRINT(CONCAT('/* Current SP Version: ', @SpCurrentVersion, ' */'))
 SELECT @DbEngineVersion = CAST(SUBSTRING(CAST(SERVERPROPERTY('ProductVersion') AS VARCHAR(20)), 1, 2) AS INT);
 IF (@DbEngineVersion < 14)
 BEGIN
-    SET @ErrorMessage = 'Sorry, on SQL Versions older than 14 (2017) you can only install/run this sp if you modify the code in all sections where @DbEngineVersion is used'
+    SET @ErrorMessage = 'You can only install/run this sp on SQL Versions older than 14 (2017) if you modify the code in all sections where @DbEngineVersion is used'
     GOTO ERROR
 END
 
@@ -220,11 +245,37 @@ BEGIN
     GOTO ERROR;
 END;
 
+IF (LEN(@SchemaNamesExpt) > 0 AND LEN(@TableNamesExpt) = 0) OR (LEN(@SchemaNamesExpt) = 0 AND LEN(@TableNamesExpt) > 0)
+BEGIN
+    SET @ErrorMessage = N'If you want to add any exceptions then both @SchemaNamesExpt and @TableNamesExpt must contain a value';
+    GOTO ERROR;
+END;
+
+IF ((CHARINDEX(@ExceptionListWildcard, @SchemaNamesExpt, 0) > 0 AND @ExceptionListWildcard <> @SchemaNamesExpt)
+OR ( CHARINDEX(@ExceptionListWildcard, @TableNamesExpt,  0) > 0 AND @ExceptionListWildcard <> @TableNamesExpt))
+BEGIN
+    SET @ErrorMessage = CONCAT(N'You can not mix the @ExceptionListWildcard: ', @ExceptionListWildcard
+                             , ' within @SchemaNamesExpt/@TableNamesExpt.
+If your @SchemaNamesExpt/@TableNamesExpt contain: ', @ExceptionListWildcard, ' then specify your own character as @ExceptionListWildcard parameter.
+Any value of @ExceptionListWildcard specified as @SchemaNamesExpt/@TableNamesExpt has to be used exclusively on its own');
+    GOTO ERROR;
+END;
+
 /* remove new-line and append delimiter at the end of @SchemaNames/@TableNames if it is missing: */
 SET @SchemaNames = REPLACE(@SchemaNames, @crlf, '')
 SET @TableNames = REPLACE(@TableNames, @crlf, '')
 IF  LEN(@SchemaNames) > 0 AND (RIGHT(@SchemaNames, 1)) <> @Delimiter SET @SchemaNames = CONCAT(@SchemaNames, @Delimiter);
 IF  LEN(@TableNames) > 0 AND (RIGHT(@TableNames, 1)) <> @Delimiter SET @TableNames = CONCAT(@TableNames, @Delimiter);
+
+SET @SchemaNamesExpt = REPLACE(@SchemaNamesExpt, @crlf, '')
+SET @TableNamesExpt = REPLACE(@TableNamesExpt, @crlf, '')
+IF  LEN(@SchemaNamesExpt) > 0 AND (RIGHT(@SchemaNamesExpt, 1)) <> @Delimiter SET @SchemaNamesExpt = CONCAT(@SchemaNamesExpt, @Delimiter);
+IF  LEN(@TableNamesExpt) > 0 AND (RIGHT(@TableNamesExpt, 1)) <> @Delimiter SET @TableNamesExpt = CONCAT(@TableNamesExpt, @Delimiter);
+
+
+/* ==================================================================================================================== */
+/* ----------------------------------------- DEFINE TEMP TABLES: ------------------------------------------------------ */
+/* ==================================================================================================================== */
 
 CREATE TABLE [#SelectedTables]
 (
@@ -238,7 +289,7 @@ CREATE TABLE [#SelectedTables]
   , [IsCDCEnabled]          BIT           NULL
   , [IsPublished]           BIT           NULL
   , [TemporalType]          TINYINT       NULL
-  , [HistoryTblObjectID]    INT           NULL UNIQUE
+  , [HistoryTblObjectID]    INT           NULL
 
   , [NumFkReferencing]      INT           NULL
   , [NumFkDropped]          INT           NULL
@@ -257,9 +308,12 @@ CREATE TABLE [#SelectedTables]
   , [RowCountBefore]        BIGINT        NULL
   , [RowCountAfter]         BIGINT        NULL
   , [IsToBeTruncated]       BIT           NULL
+  , [IsOnExceptionList]     BIT           NULL
   , [IsTruncated]           BIT           NULL
   , [ErrorMessage]          NVARCHAR(MAX) NULL
 );
+
+CREATE TABLE [#ExceptionList] ([SchemaNameExpt] SYSNAME NOT NULL, [TableNameExpt] SYSNAME NOT NULL);
 
 CREATE TABLE [#ForeignKeyConstraintDefinitions]
 (
@@ -530,6 +584,41 @@ BEGIN
     END;
 END;
 
+IF (LEN(@SchemaNamesExpt) > 0) AND (LEN(@TableNamesExpt) > 0)
+BEGIN
+SET @StartSearchSch = 0;
+SET @DelimiterPosSch = 0;
+
+WHILE CHARINDEX(@Delimiter, @SchemaNamesExpt, @StartSearchSch + 1) > 0
+    BEGIN
+        SET @DelimiterPosSch = CHARINDEX(@Delimiter, @SchemaNamesExpt, @StartSearchSch + 1) - @StartSearchSch;
+        SET @SchemaName = TRIM(SUBSTRING(@SchemaNamesExpt, @StartSearchSch, @DelimiterPosSch));
+    
+        --PRINT(CONCAT('@SchemaName: ', @SchemaName))
+    
+        BEGIN
+            SET @StartSearchTbl = 0;
+            SET @DelimiterPosTbl = 0;
+    
+            WHILE CHARINDEX(@Delimiter, @TableNamesExpt, @StartSearchTbl + 1) > 0
+            BEGIN
+                
+                SET @DelimiterPosTbl = CHARINDEX(@Delimiter, @TableNamesExpt, @StartSearchTbl + 1) - @StartSearchTbl;
+                SET @TableName = TRIM(SUBSTRING(@TableNamesExpt, @StartSearchTbl, @DelimiterPosTbl));
+                
+                --PRINT(CONCAT('@TableName: ', @TableName))
+    
+                INSERT INTO [#ExceptionList] ([SchemaNameExpt], [TableNameExpt])
+                VALUES (@SchemaName, @TableName);
+    
+                SET @StartSearchTbl = CHARINDEX(@Delimiter, @TableNamesExpt, @StartSearchTbl + @DelimiterPosTbl) + 1;
+            END;
+        END;
+        SET @StartSearchSch = CHARINDEX(@Delimiter, @SchemaNamesExpt, @StartSearchSch + @DelimiterPosSch) + 1;
+    END;
+END
+
+
 PRINT ('/*--------------------------------------- UPDATING [RowCountBefore] AND [IsToBeTruncated] OF [#SelectedTables] ---*/');
 TRUNCATE TABLE [#TableRowCounts];
 SELECT @Id = MIN([Id]), @IdMax = MAX([Id]) FROM [#SelectedTables];
@@ -597,9 +686,24 @@ FROM [#SelectedTables] AS [st]
 JOIN [#TableRowCounts] AS [trc]
     ON [trc].[ObjectID] = [st].[ObjectID];
 
+UPDATE [st]
+SET [st].[IsOnExceptionList] = 1
+  , [st].[IsToBeTruncated] = 0
+FROM [#SelectedTables] AS [st]
+WHERE EXISTS 
+(
+    SELECT 1
+    FROM 
+    [#ExceptionList] AS [el]
+    WHERE IIF([el].[SchemaNameExpt] = @ExceptionListWildcard, 1 , CHARINDEX([el].[SchemaNameExpt], [st].[SchemaName], 0)) > 0
+    AND   IIF([el].[TableNameExpt]  = @ExceptionListWildcard, 1 , CHARINDEX([el].[TableNameExpt], [st].[TableName], 0)  ) > 0
+)
+SELECT @CountExceptionList = @@ROWCOUNT
+IF (@CountExceptionList > 0) PRINT (CONCAT('/* Flagged ', @CountExceptionList, ' Records in [#SelectedTables] as Exceptions and Updated [IsToBeTruncated] = 0 */'));
+
 SELECT @CountTablesSelected = COUNT([Id]) FROM [#SelectedTables] WHERE [IsToBeTruncated] = 1;
 
-PRINT (CONCAT('/* Populated [#SelectedTables] with: ', @CountTablesSelected, ' Records */'));
+PRINT (CONCAT('/* [#SelectedTables] has a total of: ', @CountTablesSelected, ' Records WHERE [IsToBeTruncated] = 1 */'));
 
 PRINT ('/*--------------------------------------- POPULATING [#ForeignKeyConstraintDefinitions]: -------------------------*/');
 WITH [cte]
@@ -1079,7 +1183,7 @@ IF EXISTS
 (
             SELECT 1
             FROM [#SelectedTables] AS [st]
-            JOIN [sys].[tables] AS [stb]
+            JOIN sys.tables AS [stb]
                 ON  [st].[ObjectID] = [stb].[object_id]
                 AND [st].[IsToBeTruncated] = 1
                 AND [stb].[is_tracked_by_cdc] = 1
@@ -1146,9 +1250,9 @@ SELECT [ct].[object_id] AS [CdcObjectId]
 FROM [cdc].[change_tables] AS [ct]
 JOIN [cdc].[captured_columns] AS [cc]
     ON [ct].[object_id] = [cc].[object_id]
-JOIN [sys].[objects] AS [so]
+JOIN sys.objects AS [so]
     ON [ct].[source_object_id] = [so].[object_id]
-JOIN [sys].[schemas] AS [ss]
+JOIN sys.schemas AS [ss]
     ON [so].[schema_id] = [ss].[schema_id]
 JOIN [#SelectedTables] AS [st]
     ON [st].[ObjectID] = [so].[object_id]
@@ -1796,7 +1900,8 @@ BEGIN
 END;
 ELSE
 BEGIN
-    SET @ErrorMessage = CONCAT('@CountTablesSelected = ', @CountTablesSelected, ', nothing to truncate - check @RowCountThreshold: ', @RowCountThreshold, ' and [RowCountBefore]');
+    SET @ErrorMessage = CONCAT('@CountTablesSelected = ', @CountTablesSelected, ', nothing to truncate - check @RowCountThreshold: ', @RowCountThreshold, ' and [RowCountBefore] values'
+                             , IIF(LEN(@SchemaNamesExpt) > 0 OR LEN(@TableNamesExpt) > 0, ' as well as your @SchemaNamesExpt/@TableNamesExpt', ''));
     RAISERROR(@ErrorMessage, @ErrorSeverity11, 1) WITH NOWAIT;
     SET @ErrorMessage = NULL;
 END;
@@ -2760,9 +2865,10 @@ BEGIN
          , [SchemaName]
          , [TableName]
          , [IsToBeTruncated]
+         , [IsOnExceptionList]
          , [IsTruncated]
-         , [RowCountBefore]
-         , [RowCountAfter]
+         , CONCAT([RowCountBefore], IIF(@RowCountThreshold > 0 AND [RowCountBefore] < @RowCountThreshold, CONCAT(' below Threshld: ', @RowCountThreshold), '')) AS [RowCntBefore]
+         , [RowCountAfter]         
          , [ErrorMessage]
          , [IsReferencedByFk]
          , [IsReferencedBySchBv]
