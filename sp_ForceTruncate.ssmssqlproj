@@ -25,6 +25,12 @@
           <AssociatedConnUserName>sa</AssociatedConnUserName>
           <FullPath>[dbo].[sp_ForceTruncate].sql</FullPath>
         </FileNode>
+        <FileNode Name="TestCases.sql">
+          <AssociatedConnectionMoniker>8c91a03d-f9b4-46c0-a305-b5dcc79ff907:Inst1.docker.internal:False:sa</AssociatedConnectionMoniker>
+          <AssociatedConnSrvName>Inst1.docker.internal</AssociatedConnSrvName>
+          <AssociatedConnUserName>sa</AssociatedConnUserName>
+          <FullPath>TestCases.sql</FullPath>
+        </FileNode>
       </Items>
     </LogicalFolder>
     <LogicalFolder Name="Miscellaneous" Type="3" Sorted="true">

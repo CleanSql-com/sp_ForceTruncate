@@ -41,6 +41,7 @@ ALTER PROCEDURE [dbo].[sp_ForceTruncate]
 /* 2024-12-12  1.03      fixed bug: missing schema in ON clause populating [#IndexesOnSchemaBoundViews]                 */
 /* 2024-12-14  1.04      resetting @ErrorMessage = NULL after error logging in recreate section                         */
 /* 2024-12-17  1.05      added exception lists (@SchemaNamesExpt/@TableNamesExpt) for @SchemaNames/@TableNames          */
+/* 2025-05-22  1.06      fixed bug with incorrect processing when @TruncateAllTablesPerDB = NULL                        */
 /* -------------------------------------------------------------------------------------------------------------------- */
 /* ==================================================================================================================== */
 /* Example use:
@@ -118,7 +119,7 @@ DECLARE
 /* ==================================================================================================================== */
 
   /* Internal parameters: */
-    @SpCurrentVersion                CHAR(5) = '1.05'
+    @SpCurrentVersion                CHAR(5) = '1.06'
   , @ObjectId                        BIGINT
   , @SchemaId                        INT
   , @StartSearchSch                  INT
@@ -233,7 +234,7 @@ BEGIN
     GOTO ERROR
 END
 
-IF @TruncateAllTablesPerDB = 0 AND (LEN(@SchemaNames) = 0 OR LEN(@TableNames) = 0)
+IF (@TruncateAllTablesPerDB = 0 OR @TruncateAllTablesPerDB IS NULL) AND (LEN(@SchemaNames) = 0 OR LEN(@TableNames) = 0)
 BEGIN
     SET @ErrorMessage = N'@SchemaNames AND @TableNames parameters can not be empty, unless you want to truncate ALL tables per DB by using @TruncateAllTablesPerDB = 1';
     GOTO ERROR;
@@ -241,7 +242,7 @@ END;
 
 IF @TruncateAllTablesPerDB = 1 AND (LEN(@SchemaNames) > 0 OR LEN(@TableNames) > 0)
 BEGIN
-    SET @ErrorMessage = N'If you want to truncate ALL tables per DB by using @TruncateAllTablesPerDB = 1 then @SchemaNames AND @TableNames must be empty';
+    SET @ErrorMessage = N'If you want to truncate ALL tables per DB by using @TruncateAllTablesPerDB = 1 then both @SchemaNames AND @TableNames must be empty.';
     GOTO ERROR;
 END;
 
@@ -495,7 +496,27 @@ END;
 PRINT ('/*--------------------------------------- COLLECTING [#SelectedTables]: ------------------------------------------*/');
 SET @StartSearchSch = 0;
 SET @DelimiterPosSch = 0;
-IF (@TruncateAllTablesPerDB <> 1)
+IF (@TruncateAllTablesPerDB = 1)
+BEGIN
+    PRINT (CONCAT(
+                     N'/* Specified @TruncateAllTablesPerDB = 1 so collecting list of all non-system tables in the database: '
+                   , QUOTENAME(DB_NAME())
+                   , ' */'
+                 )
+          );
+
+    INSERT INTO [#SelectedTables] ([SchemaID], [ObjectID], [SchemaName], [TableName], [IsTruncated])
+    SELECT [ss].[schema_id] AS [SchemaID]
+         , [st].[object_id] AS [ObjectID]
+         , [ss].[name] AS [SchemaName]
+         , [st].[name] AS [TableName]
+         , 0
+    FROM sys.tables AS [st]
+    JOIN sys.schemas AS [ss]
+        ON [st].[schema_id] = [ss].[schema_id]
+    WHERE [st].[is_ms_shipped] <> 1;
+END
+ELSE 
 BEGIN
     WHILE CHARINDEX(@Delimiter, @SchemaNames, @StartSearchSch + 1) > 0
     BEGIN
@@ -554,26 +575,7 @@ BEGIN
         SET @StartSearchSch = CHARINDEX(@Delimiter, @SchemaNames, @StartSearchSch + @DelimiterPosSch) + 1;
     END;
 END;
-ELSE
-BEGIN
-    PRINT (CONCAT(
-                     N'/* Specified @TruncateAllTablesPerDB = 1 so collecting list of all non-system tables in the database: '
-                   , QUOTENAME(DB_NAME())
-                   , ' */'
-                 )
-          );
 
-    INSERT INTO [#SelectedTables] ([SchemaID], [ObjectID], [SchemaName], [TableName], [IsTruncated])
-    SELECT [ss].[schema_id] AS [SchemaID]
-         , [st].[object_id] AS [ObjectID]
-         , [ss].[name] AS [SchemaName]
-         , [st].[name] AS [TableName]
-         , 0
-    FROM sys.tables AS [st]
-    JOIN sys.schemas AS [ss]
-        ON [st].[schema_id] = [ss].[schema_id]
-    WHERE [st].[is_ms_shipped] <> 1;
-END;
 PRINT ('/*--------------------------------------- END OF COLLECTING [#SelectedTables] ------------------------------------*/');
 
 IF NOT EXISTS (SELECT 1 FROM [#SelectedTables])
@@ -593,8 +595,6 @@ WHILE CHARINDEX(@Delimiter, @SchemaNamesExpt, @StartSearchSch + 1) > 0
     BEGIN
         SET @DelimiterPosSch = CHARINDEX(@Delimiter, @SchemaNamesExpt, @StartSearchSch + 1) - @StartSearchSch;
         SET @SchemaName = TRIM(SUBSTRING(@SchemaNamesExpt, @StartSearchSch, @DelimiterPosSch));
-    
-        --PRINT(CONCAT('@SchemaName: ', @SchemaName))
     
         BEGIN
             SET @StartSearchTbl = 0;
