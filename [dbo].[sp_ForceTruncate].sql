@@ -42,6 +42,7 @@ ALTER PROCEDURE [dbo].[sp_ForceTruncate]
 /* 2024-12-14  1.04      resetting @ErrorMessage = NULL after error logging in recreate section                         */
 /* 2024-12-17  1.05      added exception lists (@SchemaNamesExpt/@TableNamesExpt) for @SchemaNames/@TableNames          */
 /* 2025-05-22  1.06      fixed bug with incorrect processing when @TruncateAllTablesPerDB = NULL                        */
+/* 2025-06-02  1.07      reworked [#SelectedTables] to include @WildcardChar in the selection                           */
 /* -------------------------------------------------------------------------------------------------------------------- */
 /* ==================================================================================================================== */
 /* Example use:
@@ -101,7 +102,7 @@ EXEC [dbo].[sp_ForceTruncate]
                                                             */
   , @SchemaNamesExpt                 NVARCHAR(MAX) = NULL
   , @TableNamesExpt                  NVARCHAR(MAX) = NULL
-  , @ExceptionListWildcard           CHAR(1)       = '*'
+  , @WildcardChar                    CHAR(1)       = '*'
   
   , @BatchSize                       INT           = 10
   , @ReenableCDC                     BIT           = 1
@@ -119,7 +120,7 @@ DECLARE
 /* ==================================================================================================================== */
 
   /* Internal parameters: */
-    @SpCurrentVersion                CHAR(5) = '1.06'
+    @SpCurrentVersion                CHAR(5) = '1.07'
   , @ObjectId                        BIGINT
   , @SchemaId                        INT
   , @StartSearchSch                  INT
@@ -151,7 +152,7 @@ DECLARE
   , @ErrorMessage                    NVARCHAR(MAX)
   , @ErrorSeverity11                 INT           = 11     /* 11 changes the message color to red */
   , @ErrorSeverity18                 INT           = 18     /* 16 and below does not break execution */
-  , @ErrorState                      INT
+  , @ErrorState                      INT           = 1
 
   
   /* dynamic sql variables: */
@@ -252,27 +253,203 @@ BEGIN
     GOTO ERROR;
 END;
 
-IF ((CHARINDEX(@ExceptionListWildcard, @SchemaNamesExpt, 0) > 0 AND @ExceptionListWildcard <> @SchemaNamesExpt)
-OR ( CHARINDEX(@ExceptionListWildcard, @TableNamesExpt,  0) > 0 AND @ExceptionListWildcard <> @TableNamesExpt))
+DECLARE @_SchemaNames TABLE
+(
+    [Id]               INT     NOT NULL PRIMARY KEY CLUSTERED IDENTITY(1, 1)
+  , [SchemaName]       SYSNAME NOT NULL
+  , [ContainsWildcard] BIT     NULL
+);
+DECLARE @_TableNames TABLE
+(
+    [Id]               INT     NOT NULL PRIMARY KEY CLUSTERED IDENTITY(1, 1)
+  , [TableName]        SYSNAME NOT NULL
+  , [ContainsWildcard] BIT     NULL
+);
+
+DECLARE @_SchemaNamesExpt TABLE
+(
+    [Id]               INT     NOT NULL PRIMARY KEY CLUSTERED IDENTITY(1, 1)
+  , [SchemaName]       SYSNAME NOT NULL
+  , [ContainsWildcard] BIT     NULL
+);
+DECLARE @_TableNamesExpt TABLE
+(
+    [Id]               INT     NOT NULL PRIMARY KEY CLUSTERED IDENTITY(1, 1)
+  , [TableName]        SYSNAME NOT NULL
+  , [ContainsWildcard] BIT     NULL
+);
+
+INSERT INTO @_SchemaNames ([SchemaName])
+SELECT DISTINCT
+       TRIM([value])
+FROM STRING_SPLIT(REPLACE(@SchemaNames, @crlf, ''), @Delimiter)
+WHERE LEN(TRIM([value])) > 0;
+
+INSERT INTO @_TableNames ([TableName])
+SELECT DISTINCT
+       TRIM([value])
+FROM STRING_SPLIT(REPLACE(@TableNames, @crlf, ''), @Delimiter)
+WHERE LEN(TRIM([value])) > 0;
+
+INSERT INTO @_SchemaNamesExpt ([SchemaName])
+SELECT DISTINCT
+       TRIM([value])
+FROM STRING_SPLIT(REPLACE(@SchemaNamesExpt, @crlf, ''), @Delimiter)
+WHERE LEN(TRIM([value])) > 0;
+
+INSERT INTO @_TableNamesExpt ([TableName])
+SELECT DISTINCT
+       TRIM([value])
+FROM STRING_SPLIT(REPLACE(@TableNamesExpt, @crlf, ''), @Delimiter)
+WHERE LEN(TRIM([value])) > 0;
+
+UPDATE @_SchemaNames SET [ContainsWildcard] = IIF(CHARINDEX(@WildcardChar, [SchemaName], 0) > 0, 1, 0)
+UPDATE @_TableNames SET [ContainsWildcard] = IIF(CHARINDEX(@WildcardChar, [TableName], 0) > 0, 1, 0)
+UPDATE @_SchemaNamesExpt SET [ContainsWildcard] = IIF(CHARINDEX(@WildcardChar, [SchemaName], 0) > 0, 1, 0)
+UPDATE @_TableNamesExpt SET [ContainsWildcard] = IIF(CHARINDEX(@WildcardChar, [TableName], 0) > 0, 1, 0)
+
+IF EXISTS (SELECT 1 FROM @_SchemaNames AS [tn] WHERE [ContainsWildcard] = 1)
 BEGIN
-    SET @ErrorMessage = CONCAT(N'You can not mix the @ExceptionListWildcard: ', @ExceptionListWildcard
-                             , ' within @SchemaNamesExpt/@TableNamesExpt.
-If your @SchemaNamesExpt/@TableNamesExpt contain: ', @ExceptionListWildcard, ' then specify your own character as @ExceptionListWildcard parameter.
-Any value of @ExceptionListWildcard specified as @SchemaNamesExpt/@TableNamesExpt has to be used exclusively on its own');
+    SELECT @Id = MIN([Id]), @IdMax = MAX([Id]) FROM @_SchemaNames WHERE [ContainsWildcard] = 1;
+    WHILE (@Id <= @IdMax)
+    BEGIN
+        MERGE @_SchemaNames AS TARGET USING   
+        (
+            SELECT [name] AS [SchemaName] FROM sys.schemas WHERE [name] LIKE (SELECT REPLACE([SchemaName], @WildcardChar, '%') FROM @_SchemaNames WHERE [Id] = @Id) 
+        ) AS SOURCE
+        ON TARGET.[SchemaName] = SOURCE.[SchemaName]
+        WHEN NOT MATCHED BY TARGET THEN
+        INSERT ([SchemaName]) VALUES (SOURCE.[SchemaName]);
+                
+        DELETE FROM @_SchemaNames WHERE [Id] = @Id;
+        SELECT @Id = COALESCE(MIN([Id]), @Id + 1) FROM @_SchemaNames WHERE [ContainsWildcard] = 1 AND [Id] > @Id;        
+    END
+END
+
+IF EXISTS (SELECT 1 FROM @_TableNames AS [tn] WHERE [ContainsWildcard] = 1)
+BEGIN
+    SELECT @Id = MIN([Id]), @IdMax = MAX([Id]) FROM @_TableNames WHERE [ContainsWildcard] = 1;
+    WHILE (@Id <= @IdMax)
+    BEGIN
+        MERGE @_TableNames AS TARGET USING   
+        (
+            SELECT [name] AS [TableName] FROM sys.tables WHERE [name] LIKE (SELECT REPLACE([TableName], @WildcardChar, '%') FROM @_TableNames WHERE [Id] = @Id) 
+        ) AS SOURCE
+        ON TARGET.[TableName] = SOURCE.[TableName]
+        WHEN NOT MATCHED BY TARGET THEN
+        INSERT ([TableName]) VALUES (SOURCE.[TableName]);
+                
+        DELETE FROM @_TableNames WHERE [Id] = @Id;
+        SELECT @Id = COALESCE(MIN([Id]), @Id + 1) FROM @_TableNames WHERE [ContainsWildcard] = 1 AND [Id] > @Id;        
+    END
+END
+
+IF EXISTS (SELECT 1 FROM @_SchemaNamesExpt AS [tn] WHERE [ContainsWildcard] = 1)
+BEGIN
+    SELECT @Id = MIN([Id]), @IdMax = MAX([Id]) FROM @_SchemaNamesExpt WHERE [ContainsWildcard] = 1;
+    WHILE (@Id <= @IdMax)
+    BEGIN
+        MERGE @_SchemaNamesExpt AS TARGET USING   
+        (
+            SELECT [name] AS [SchemaName] FROM sys.schemas WHERE [name] LIKE (SELECT REPLACE([SchemaName], @WildcardChar, '%') FROM @_SchemaNamesExpt WHERE [Id] = @Id) 
+        ) AS SOURCE
+        ON TARGET.[SchemaName] = SOURCE.[SchemaName]
+        WHEN NOT MATCHED BY TARGET THEN
+        INSERT ([SchemaName]) VALUES (SOURCE.[SchemaName]);
+                
+        DELETE FROM @_SchemaNamesExpt WHERE [Id] = @Id;
+        SELECT @Id = COALESCE(MIN([Id]), @Id + 1) FROM @_SchemaNamesExpt WHERE [ContainsWildcard] = 1 AND [Id] > @Id;        
+    END
+END
+
+IF EXISTS (SELECT 1 FROM @_TableNamesExpt AS [tn] WHERE [ContainsWildcard] = 1)
+BEGIN
+    SELECT @Id = MIN([Id]), @IdMax = MAX([Id]) FROM @_TableNamesExpt WHERE [ContainsWildcard] = 1;
+    WHILE (@Id <= @IdMax)
+    BEGIN
+        MERGE @_TableNamesExpt AS TARGET USING   
+        (
+            SELECT [name] AS [TableName] FROM sys.tables WHERE [name] LIKE (SELECT REPLACE([TableName], @WildcardChar, '%') FROM @_TableNamesExpt WHERE [Id] = @Id) 
+        ) AS SOURCE
+        ON TARGET.[TableName] = SOURCE.[TableName]
+        WHEN NOT MATCHED BY TARGET THEN
+        INSERT ([TableName]) VALUES (SOURCE.[TableName]);
+                
+        DELETE FROM @_TableNamesExpt WHERE [Id] = @Id;
+        SELECT @Id = COALESCE(MIN([Id]), @Id + 1) FROM @_TableNamesExpt WHERE [ContainsWildcard] = 1 AND [Id] > @Id;        
+    END
+END
+
+--SELECT * FROM @_SchemaNames
+/* Verify all SchemaNames requested: */
+IF (@TruncateAllTablesPerDB = 0 OR @TruncateAllTablesPerDB IS NULL) AND EXISTS (
+              SELECT 1
+              FROM @_SchemaNames AS [sn]
+              LEFT JOIN sys.schemas AS [ss]
+                  ON [sn].[SchemaName] = [ss].[name]
+              WHERE [ss].[name] IS NULL
+          )
+BEGIN
+    SELECT @ErrorMessage = CONCAT('The following schmema names could not be found in ', DB_NAME(), ' database: [', STRING_AGG([sn].[SchemaName], ','), ']')
+    FROM @_SchemaNames AS [sn]
+    LEFT JOIN sys.schemas AS [ss]
+        ON [sn].[SchemaName] = [ss].[name]
+    WHERE [ss].[name] IS NULL;
     GOTO ERROR;
-END;
+END
 
-/* remove new-line and append delimiter at the end of @SchemaNames/@TableNames if it is missing: */
-SET @SchemaNames = REPLACE(@SchemaNames, @crlf, '')
-SET @TableNames = REPLACE(@TableNames, @crlf, '')
-IF  LEN(@SchemaNames) > 0 AND (RIGHT(@SchemaNames, 1)) <> @Delimiter SET @SchemaNames = CONCAT(@SchemaNames, @Delimiter);
-IF  LEN(@TableNames) > 0 AND (RIGHT(@TableNames, 1)) <> @Delimiter SET @TableNames = CONCAT(@TableNames, @Delimiter);
 
-SET @SchemaNamesExpt = REPLACE(@SchemaNamesExpt, @crlf, '')
-SET @TableNamesExpt = REPLACE(@TableNamesExpt, @crlf, '')
-IF  LEN(@SchemaNamesExpt) > 0 AND (RIGHT(@SchemaNamesExpt, 1)) <> @Delimiter SET @SchemaNamesExpt = CONCAT(@SchemaNamesExpt, @Delimiter);
-IF  LEN(@TableNamesExpt) > 0 AND (RIGHT(@TableNamesExpt, 1)) <> @Delimiter SET @TableNamesExpt = CONCAT(@TableNamesExpt, @Delimiter);
+--SELECT * FROM @_TableNames
+/* Verify all TableNames requested: */
+IF (@TruncateAllTablesPerDB = 0 OR @TruncateAllTablesPerDB IS NULL) AND EXISTS (
+              SELECT 1
+              FROM @_TableNames AS [tn]
+              LEFT JOIN sys.tables AS [st]
+                  ON [tn].[TableName] = [st].[name]
+              WHERE [st].[name] IS NULL
+          )
+BEGIN
+    SELECT @ErrorMessage = CONCAT('The following table names could not be found in ', DB_NAME(), ' database: [', STRING_AGG([tn].[TableName], ','), ']')
+    FROM @_TableNames AS [tn]
+    LEFT JOIN sys.tables AS [st]
+        ON [tn].[TableName] = [st].[name]
+    WHERE [st].[name] IS NULL;
+    GOTO ERROR;
+END
 
+/* Verify all SchemaNamesExpt requested: */
+IF EXISTS (
+              SELECT 1
+              FROM @_SchemaNamesExpt AS [sn]
+              LEFT JOIN sys.schemas AS [ss]
+                  ON [sn].[SchemaName] = [ss].[name]
+              WHERE [ss].[name] IS NULL
+          )
+BEGIN
+    SELECT @ErrorMessage = CONCAT('The following SchemaNames specified as Expt could not be found in ', DB_NAME(), ' database: [', STRING_AGG([sn].[SchemaName], ','), ']')
+    FROM @_SchemaNamesExpt AS [sn]
+    LEFT JOIN sys.schemas AS [ss]
+        ON [sn].[SchemaName] = [ss].[name]
+    WHERE [ss].[name] IS NULL;
+    GOTO ERROR;
+END
+
+/* Verify all TableNamesExpt requested: */
+IF EXISTS (
+              SELECT 1
+              FROM @_TableNamesExpt AS [tn]
+              LEFT JOIN sys.tables AS [st]
+                  ON [tn].[TableName] = [st].[name]
+              WHERE [st].[name] IS NULL
+          )
+BEGIN
+    SELECT @ErrorMessage = CONCAT('The following TableNames specified as Expt could not be found in ', DB_NAME(), ' database: [', STRING_AGG([tn].[TableName], ','), ']')
+    FROM @_TableNamesExpt AS [tn]
+    LEFT JOIN sys.tables AS [st]
+        ON [tn].[TableName] = [st].[name]
+    WHERE [st].[name] IS NULL;
+    GOTO ERROR;
+END
 
 /* ==================================================================================================================== */
 /* ----------------------------------------- DEFINE TEMP TABLES: ------------------------------------------------------ */
@@ -314,7 +491,6 @@ CREATE TABLE [#SelectedTables]
   , [ErrorMessage]          NVARCHAR(MAX) NULL
 );
 
-CREATE TABLE [#ExceptionList] ([SchemaNameExpt] SYSNAME NOT NULL, [TableNameExpt] SYSNAME NOT NULL);
 
 CREATE TABLE [#ForeignKeyConstraintDefinitions]
 (
@@ -518,62 +694,21 @@ BEGIN
 END
 ELSE 
 BEGIN
-    WHILE CHARINDEX(@Delimiter, @SchemaNames, @StartSearchSch + 1) > 0
-    BEGIN
-        SET @DelimiterPosSch = CHARINDEX(@Delimiter, @SchemaNames, @StartSearchSch + 1) - @StartSearchSch;
-        SET @SchemaName = TRIM(SUBSTRING(@SchemaNames, @StartSearchSch, @DelimiterPosSch));
-        SET @SchemaId = NULL;
-
-        SET @SqlSchemaId = CONCAT('SELECT @_SchemaId = schema_id FROM [', DB_NAME(), '].sys.schemas WHERE name = @_SchemaName;');
-        SET @ParamDefinition = N'@_SchemaName SYSNAME, @_SchemaId INT OUTPUT';
-
-        EXEC sys.sp_executesql @stmt = @SqlSchemaId, @params = @ParamDefinition, @_SchemaName = @SchemaName, @_SchemaId = @SchemaId OUTPUT;
-
-        IF (@SchemaId IS NULL)
-        BEGIN
-            SET @ErrorMessage = CONCAT('Could not find @SchemaName: ', QUOTENAME(@SchemaName), ' in Database: ', QUOTENAME(DB_NAME()));
-            GOTO ERROR;    
-        END
-        ELSE 
-        BEGIN
-            SET @StartSearchTbl = 0;
-            SET @DelimiterPosTbl = 0;
-
-            WHILE CHARINDEX(@Delimiter, @TableNames, @StartSearchTbl + 1) > 0
-            BEGIN
-                SET @DelimiterPosTbl = CHARINDEX(@Delimiter, @TableNames, @StartSearchTbl + 1) - @StartSearchTbl;
-                SET @TableName = TRIM(SUBSTRING(@TableNames, @StartSearchTbl, @DelimiterPosTbl));
-                SET @ObjectId = NULL
-
-                SET @SqlObjectId = CONCAT('SELECT @_ObjectId = object_id FROM [', DB_NAME(), '].sys.tables WHERE [is_ms_shipped] = 0 AND name = @_TableName;');
-                SET @ParamDefinition = N'@_TableName SYSNAME, @_ObjectId INT OUTPUT';
-
-                EXEC sys.sp_executesql @stmt = @SqlObjectId, @params = @ParamDefinition, @_TableName = @TableName, @_ObjectId = @ObjectId OUTPUT;
-
-                IF (@ObjectId IS NULL)
-                BEGIN
-                    SET @ErrorMessage = CONCAT('Could not find @TableName: ', QUOTENAME(@TableName), ' in any schema within Database: ', QUOTENAME(DB_NAME()));
-                    GOTO ERROR;
-                END
-                ELSE 
-                BEGIN
-                    /* PRINT(CONCAT('Found a Table with name: ', @TableName, ' now trying to find an ObjectId for: ', '[', @SchemaName, '].[', @TableName, ']')) */
-                    /* Below is not redundant: your @TableName may exist in other schema(s) not included in @SchemaNames so the @ObjectId obtained above may be wrong for that @TableName */                    
-                    SET @ObjectId = NULL
-                    SET @ObjectId = OBJECT_ID('[' + @SchemaName + '].[' + @TableName + ']');
-                END
-                
-                IF (@ObjectId IS NOT NULL)
-                BEGIN
-                    INSERT INTO [#SelectedTables] ([SchemaID], [ObjectID], [SchemaName], [TableName], [IsTruncated])
-                    VALUES (@SchemaId, @ObjectId, @SchemaName, @TableName, 0);
-                END;
-
-                SET @StartSearchTbl = CHARINDEX(@Delimiter, @TableNames, @StartSearchTbl + @DelimiterPosTbl) + 1;
-            END;
-        END;
-        SET @StartSearchSch = CHARINDEX(@Delimiter, @SchemaNames, @StartSearchSch + @DelimiterPosSch) + 1;
-    END;
+    INSERT INTO [#SelectedTables]
+        (
+            [SchemaID]
+          , [ObjectID]
+          , [SchemaName]
+          , [TableName]
+        )
+    SELECT 
+      SCHEMA_ID([sn].[SchemaName]) AS [ScemaId]
+    , OBJECT_ID(CONCAT(QUOTENAME([sn].[SchemaName]), '.', QUOTENAME([tn].[TableName]))) AS [ObjectId]
+    , [sn].[SchemaName]
+    , [tn].[TableName] 
+    FROM @_SchemaNames AS [sn]
+    CROSS JOIN @_TableNames AS [tn]
+    WHERE OBJECT_ID(CONCAT(QUOTENAME([sn].[SchemaName]), '.', QUOTENAME([tn].[TableName]))) IS NOT NULL;
 END;
 
 PRINT ('/*--------------------------------------- END OF COLLECTING [#SelectedTables] ------------------------------------*/');
@@ -586,37 +721,19 @@ BEGIN
     END;
 END;
 
-IF (LEN(@SchemaNamesExpt) > 0) AND (LEN(@TableNamesExpt) > 0)
-BEGIN
-SET @StartSearchSch = 0;
-SET @DelimiterPosSch = 0;
-
-WHILE CHARINDEX(@Delimiter, @SchemaNamesExpt, @StartSearchSch + 1) > 0
-    BEGIN
-        SET @DelimiterPosSch = CHARINDEX(@Delimiter, @SchemaNamesExpt, @StartSearchSch + 1) - @StartSearchSch;
-        SET @SchemaName = TRIM(SUBSTRING(@SchemaNamesExpt, @StartSearchSch, @DelimiterPosSch));
-    
-        BEGIN
-            SET @StartSearchTbl = 0;
-            SET @DelimiterPosTbl = 0;
-    
-            WHILE CHARINDEX(@Delimiter, @TableNamesExpt, @StartSearchTbl + 1) > 0
-            BEGIN
-                
-                SET @DelimiterPosTbl = CHARINDEX(@Delimiter, @TableNamesExpt, @StartSearchTbl + 1) - @StartSearchTbl;
-                SET @TableName = TRIM(SUBSTRING(@TableNamesExpt, @StartSearchTbl, @DelimiterPosTbl));
-                
-                --PRINT(CONCAT('@TableName: ', @TableName))
-    
-                INSERT INTO [#ExceptionList] ([SchemaNameExpt], [TableNameExpt])
-                VALUES (@SchemaName, @TableName);
-    
-                SET @StartSearchTbl = CHARINDEX(@Delimiter, @TableNamesExpt, @StartSearchTbl + @DelimiterPosTbl) + 1;
-            END;
-        END;
-        SET @StartSearchSch = CHARINDEX(@Delimiter, @SchemaNamesExpt, @StartSearchSch + @DelimiterPosSch) + 1;
-    END;
-END
+UPDATE [st]
+SET [st].[IsOnExceptionList] = IIF([expt].[IsExpt] = 1, 1, 0)
+  , [st].[IsToBeTruncated] = IIF([expt].[IsExpt] = 1, 0, 1)
+FROM [#SelectedTables] AS [st]
+OUTER APPLY 
+(
+    SELECT 1 AS [IsExpt]
+    FROM @_SchemaNamesExpt AS [snx]
+    CROSS JOIN @_TableNamesExpt AS [tnx]
+    WHERE OBJECT_ID(CONCAT(QUOTENAME([snx].[SchemaName]), '.', QUOTENAME([tnx].[TableName]))) IS NOT NULL
+    AND SCHEMA_ID([snx].[SchemaName]) = [st].[SchemaID]
+    AND OBJECT_ID(CONCAT(QUOTENAME([snx].[SchemaName]), '.', QUOTENAME([tnx].[TableName]))) = [st].[ObjectID]
+) AS [expt]
 
 
 PRINT ('/*--------------------------------------- UPDATING [RowCountBefore] AND [IsToBeTruncated] OF [#SelectedTables] ---*/');
@@ -681,28 +798,12 @@ END;
 
 UPDATE [st]
 SET [st].[RowCountBefore] = [trc].[RowCount]
-  , [st].[IsToBeTruncated] = IIF([trc].[RowCount] > COALESCE(@RowCountThreshold, 0), 1, 0)
+  , [st].[IsToBeTruncated] = IIF([trc].[RowCount] >= COALESCE(@RowCountThreshold, 0) AND [st].[IsOnExceptionList] <> 1, 1, 0)
 FROM [#SelectedTables] AS [st]
 JOIN [#TableRowCounts] AS [trc]
-    ON [trc].[ObjectID] = [st].[ObjectID];
-
-UPDATE [st]
-SET [st].[IsOnExceptionList] = 1
-  , [st].[IsToBeTruncated] = 0
-FROM [#SelectedTables] AS [st]
-WHERE EXISTS 
-(
-    SELECT 1
-    FROM 
-    [#ExceptionList] AS [el]
-    WHERE IIF([el].[SchemaNameExpt] = @ExceptionListWildcard, 1 , CHARINDEX([el].[SchemaNameExpt], [st].[SchemaName], 0)) > 0
-    AND   IIF([el].[TableNameExpt]  = @ExceptionListWildcard, 1 , CHARINDEX([el].[TableNameExpt], [st].[TableName], 0)  ) > 0
-)
-SELECT @CountExceptionList = @@ROWCOUNT
-IF (@CountExceptionList > 0) PRINT (CONCAT('/* Flagged ', @CountExceptionList, ' Records in [#SelectedTables] as Exceptions and Updated [IsToBeTruncated] = 0 */'));
+    ON [trc].[ObjectID] = [st].[ObjectID]
 
 SELECT @CountTablesSelected = COUNT([Id]) FROM [#SelectedTables] WHERE [IsToBeTruncated] = 1;
-
 PRINT (CONCAT('/* [#SelectedTables] has a total of: ', @CountTablesSelected, ' Records WHERE [IsToBeTruncated] = 1 */'));
 
 PRINT ('/*--------------------------------------- POPULATING [#ForeignKeyConstraintDefinitions]: -------------------------*/');
