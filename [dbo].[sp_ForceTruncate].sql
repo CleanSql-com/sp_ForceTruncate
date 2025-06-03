@@ -235,7 +235,7 @@ BEGIN
     GOTO ERROR
 END
 
-IF (@TruncateAllTablesPerDB = 0 OR @TruncateAllTablesPerDB IS NULL) AND (LEN(@SchemaNames) = 0 OR LEN(@TableNames) = 0)
+IF (@TruncateAllTablesPerDB = 0 OR @TruncateAllTablesPerDB IS NULL) AND (@SchemaNames IS NULL OR @TableNames IS NULL OR LEN(@SchemaNames) = 0 OR LEN(@TableNames) = 0)
 BEGIN
     SET @ErrorMessage = N'@SchemaNames AND @TableNames parameters can not be empty, unless you want to truncate ALL tables per DB by using @TruncateAllTablesPerDB = 1';
     GOTO ERROR;
@@ -308,6 +308,7 @@ UPDATE @_TableNames SET [ContainsWildcard] = IIF(CHARINDEX(@WildcardChar, [Table
 UPDATE @_SchemaNamesExpt SET [ContainsWildcard] = IIF(CHARINDEX(@WildcardChar, [SchemaName], 0) > 0, 1, 0)
 UPDATE @_TableNamesExpt SET [ContainsWildcard] = IIF(CHARINDEX(@WildcardChar, [TableName], 0) > 0, 1, 0)
 
+/* Expand all wildcard character entries into table varaibles:  */
 IF EXISTS (SELECT 1 FROM @_SchemaNames AS [tn] WHERE [ContainsWildcard] = 1)
 BEGIN
     SELECT @Id = MIN([Id]), @IdMax = MAX([Id]) FROM @_SchemaNames WHERE [ContainsWildcard] = 1;
@@ -380,9 +381,8 @@ BEGIN
     END
 END
 
---SELECT * FROM @_SchemaNames
 /* Verify all SchemaNames requested: */
-IF (@TruncateAllTablesPerDB = 0 OR @TruncateAllTablesPerDB IS NULL) AND EXISTS (
+IF EXISTS (
               SELECT 1
               FROM @_SchemaNames AS [sn]
               LEFT JOIN sys.schemas AS [ss]
@@ -398,10 +398,8 @@ BEGIN
     GOTO ERROR;
 END
 
-
---SELECT * FROM @_TableNames
 /* Verify all TableNames requested: */
-IF (@TruncateAllTablesPerDB = 0 OR @TruncateAllTablesPerDB IS NULL) AND EXISTS (
+IF EXISTS (
               SELECT 1
               FROM @_TableNames AS [tn]
               LEFT JOIN sys.tables AS [st]
@@ -700,12 +698,14 @@ BEGIN
           , [ObjectID]
           , [SchemaName]
           , [TableName]
+          , [IsTruncated]
         )
     SELECT 
       SCHEMA_ID([sn].[SchemaName]) AS [ScemaId]
     , OBJECT_ID(CONCAT(QUOTENAME([sn].[SchemaName]), '.', QUOTENAME([tn].[TableName]))) AS [ObjectId]
     , [sn].[SchemaName]
-    , [tn].[TableName] 
+    , [tn].[TableName]
+    , 0
     FROM @_SchemaNames AS [sn]
     CROSS JOIN @_TableNames AS [tn]
     WHERE OBJECT_ID(CONCAT(QUOTENAME([sn].[SchemaName]), '.', QUOTENAME([tn].[TableName]))) IS NOT NULL;

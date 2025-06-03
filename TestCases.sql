@@ -35,11 +35,24 @@ DECLARE @SchemaNames         NVARCHAR(MAX) = N'Sales
 
 EXEC [dbo].[sp_ForceTruncate] @SchemaNames = @SchemaNames
                             , @TableNames = @TableNames
+                            , @WhatIf = 1
+GO
+
+                                                                                                                   
+/* Truncating all tables in Sales and Purchasing Schemas EXCEPT FOR any table ending with 'Detail': */
+USE [AdventureWorks2019]
+GO
+
+EXEC [dbo].[sp_ForceTruncate] 
+                                     @SchemaNames = N'Sales,Purchasing'
+                                   , @TableNames = '*'
+                                   , @SchemaNamesExpt = '*'
+                                   , @TableNamesExpt = '*Detail'
+                                   , @WhatIf = 1
 GO
 
 
-                                                                                                                     
-/* Truncating all tables over 10 records EXCEPT FOR all tables in HumanResources schema: */
+/* Truncating all tables in DB with over 10 records EXCEPT FOR all tables in HumanResources schema: */
 USE [AdventureWorks2019]
 GO
 
@@ -51,8 +64,8 @@ EXEC [dbo].[sp_ForceTruncate]
                                    , @WhatIf = 1
 GO
 
-/* Truncating all tables in all schemas matching name patterns: N'*Product*, *Address, *Tax*, Employee*' 
-   except for Table names matching pattern: '*History': */
+/* Truncating all tables in all schemas matching table-name patterns: N'*Product*, *Address, *Tax*, Employee*' 
+   except for table names matching pattern: '*History' and tables with row count < 100: */
 USE [AdventureWorks2019]
 GO
 
@@ -66,11 +79,12 @@ EXEC [dbo].[sp_ForceTruncate] @SchemaNames = @SchemaNames
                             , @TableNames = @TableNames
                             , @SchemaNamesExpt = @SchemaNamesExpt
                             , @TableNamesExpt = @TableNamesExpt
+                            , @RowCountThreshold = 100
                             , @WhatIf = 1
 GO
 
                                   
-/* Truncating all tables over 1000 records EXCEPT FOR all tables with 'Dim' in the table name: */
+/* Truncating all tables with row-count >= 1000 EXCEPT FOR all tables with 'Dim' in the table name: */
 USE [AdventureWorksDW2019]
 GO
 
