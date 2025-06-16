@@ -45,7 +45,7 @@ ALTER PROCEDURE [dbo].[sp_ForceTruncate]
 /* 2025-06-02  1.07      reworked [#SelectedTables] to include @WildcardChar in the selection                           */
 /* -------------------------------------------------------------------------------------------------------------------- */
 /* ==================================================================================================================== */
-/* Example use:
+/* Example use: 
 
 USE [AdventureWorks2019];
 GO
@@ -62,7 +62,7 @@ EXEC [dbo].[sp_ForceTruncate] @SchemaNames = @SchemaNames
 GO
 
                                                                                                                    
-/* Truncating all tables in Sales and Purchasing Schemas EXCEPT FOR any table ending with 'Detail': */
+-- Truncating all tables in Sales and Purchasing Schemas EXCEPT FOR any table ending with 'Detail':
 USE [AdventureWorks2019]
 GO
 
@@ -74,7 +74,7 @@ EXEC [dbo].[sp_ForceTruncate]
 GO
 
 
-/* Truncating all tables in DB with over 10 records EXCEPT FOR all tables in HumanResources schema: */
+-- Truncating all tables in DB with over 10 records EXCEPT FOR all tables in HumanResources schema:
 USE [AdventureWorks2019]
 GO
 
@@ -85,8 +85,8 @@ EXEC [dbo].[sp_ForceTruncate]
                                    , @RowCountThreshold = 10
 GO
 
-/* Truncating all tables in all schemas matching table-name patterns: N'*Product*, *Address, *Tax*, Employee*' 
-   except for table names matching pattern: '*History' and tables with row count < 100: */
+-- Truncating all tables in all schemas matching table-name patterns: N'*Product*, *Address, *Tax*, Employee*' 
+-- except for table names matching pattern: '*History' and tables with row count < 100: 
 USE [AdventureWorks2019]
 GO
 
@@ -104,7 +104,7 @@ EXEC [dbo].[sp_ForceTruncate] @SchemaNames = @SchemaNames
 GO
 
                                   
-/* Truncating all tables with row-count >= 1000 EXCEPT FOR all tables with 'Dim' in the table name: */
+-- Truncating all tables with row-count >= 1000 EXCEPT FOR all tables with 'Dim' in the table name:
 USE [AdventureWorksDW2019]
 GO
 
